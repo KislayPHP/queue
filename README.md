@@ -1,6 +1,20 @@
 # KislayPHP Queue
 
-Queue extension for KislayPHP.
+KislayPHP Queue is a simple in-memory queue for lightweight background job flows.
+
+## Key Features
+
+- Enqueue, dequeue, and size operations.
+- Simple API for local processing.
+
+## Use Cases
+
+- Local job processing during development.
+- Prototyping background workflows.
+
+## SEO Keywords
+
+PHP queue, in-memory queue, job queue, C++ PHP extension
 
 ## Repository
 
