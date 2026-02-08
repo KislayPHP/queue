@@ -1,6 +1,19 @@
-# kislayphp_queue
+# KislayPHP Queue
 
 Queue extension for KislayPHP.
+
+## Repository
+
+- https://github.com/KislayPHP/queue
+
+## Related Modules
+
+- https://github.com/KislayPHP/core
+- https://github.com/KislayPHP/eventbus
+- https://github.com/KislayPHP/discovery
+- https://github.com/KislayPHP/gateway
+- https://github.com/KislayPHP/config
+- https://github.com/KislayPHP/metrics
 
 ## Build
 
@@ -13,7 +26,7 @@ make
 ## Run Locally
 
 ```sh
-cd /path/to/phpExtension/kislayphp_queue
+cd /path/to/queue
 php -d extension=modules/kislayphp_queue.so example.php
 ```
 
