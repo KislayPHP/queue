@@ -1,10 +1,10 @@
 # KislayPHP Queue
 
-KislayPHP Queue is a simple in-memory queue for lightweight background job flows.
+KislayPHP Queue is a simple queue for lightweight background jobs in PHP microservices.
 
 ## Key Features
 
-- Enqueue, dequeue, and size operations.
+- Enqueue, dequeue, and size operations in memory or via a custom client.
 - Simple API for local processing.
 
 ## Use Cases
@@ -14,7 +14,7 @@ KislayPHP Queue is a simple in-memory queue for lightweight background job flows
 
 ## SEO Keywords
 
-PHP queue, in-memory queue, job queue, C++ PHP extension
+PHP queue, in-memory queue, job queue, background jobs, C++ PHP extension, microservices
 
 ## Repository
 
@@ -42,6 +42,19 @@ make
 ```sh
 cd /path/to/queue
 php -d extension=modules/kislayphp_queue.so example.php
+```
+
+## Custom Client Interface
+
+Default is in-memory. To plug in Redis, MySQL, Mongo, or any other backend, provide
+your own PHP client that implements `KislayPHP\Queue\ClientInterface` and call
+`setClient()`.
+
+Example:
+
+```php
+$queue = new KislayPHP\Queue\Queue();
+$queue->setClient(new MyQueueClient());
 ```
 
 ## Example
