@@ -1,20 +1,70 @@
 extern "C" {
 #include "php.h"
 #include "ext/standard/info.h"
+#include "Zend/zend_API.h"
+#include "Zend/zend_interfaces.h"
 #include "Zend/zend_exceptions.h"
 }
 
 #include "php_kislayphp_queue.h"
 
+#include <cstring>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
+#ifndef zend_call_method_with_0_params
+static inline void kislayphp_call_method_with_0_params(
+    zend_object *obj,
+    zend_class_entry *obj_ce,
+    zend_function **fn_proxy,
+    const char *function_name,
+    zval *retval) {
+    zend_call_method(obj, obj_ce, fn_proxy, function_name, std::strlen(function_name), retval, 0, nullptr, nullptr);
+}
+
+#define zend_call_method_with_0_params(obj, obj_ce, fn_proxy, function_name, retval) \
+    kislayphp_call_method_with_0_params(obj, obj_ce, fn_proxy, function_name, retval)
+#endif
+
+#ifndef zend_call_method_with_1_params
+static inline void kislayphp_call_method_with_1_params(
+    zend_object *obj,
+    zend_class_entry *obj_ce,
+    zend_function **fn_proxy,
+    const char *function_name,
+    zval *retval,
+    zval *param1) {
+    zend_call_method(obj, obj_ce, fn_proxy, function_name, std::strlen(function_name), retval, 1, param1, nullptr);
+}
+
+#define zend_call_method_with_1_params(obj, obj_ce, fn_proxy, function_name, retval, param1) \
+    kislayphp_call_method_with_1_params(obj, obj_ce, fn_proxy, function_name, retval, param1)
+#endif
+
+#ifndef zend_call_method_with_2_params
+static inline void kislayphp_call_method_with_2_params(
+    zend_object *obj,
+    zend_class_entry *obj_ce,
+    zend_function **fn_proxy,
+    const char *function_name,
+    zval *retval,
+    zval *param1,
+    zval *param2) {
+    zend_call_method(obj, obj_ce, fn_proxy, function_name, std::strlen(function_name), retval, 2, param1, param2);
+}
+
+#define zend_call_method_with_2_params(obj, obj_ce, fn_proxy, function_name, retval, param1, param2) \
+    kislayphp_call_method_with_2_params(obj, obj_ce, fn_proxy, function_name, retval, param1, param2)
+#endif
 static zend_class_entry *kislayphp_queue_ce;
+static zend_class_entry *kislayphp_queue_client_ce;
 
 typedef struct _php_kislayphp_queue_t {
     zend_object std;
     std::unordered_map<std::string, std::vector<zval>> queues;
+    zval client;
+    bool has_client;
 } php_kislayphp_queue_t;
 
 static zend_object_handlers kislayphp_queue_handlers;
@@ -30,12 +80,17 @@ static zend_object *kislayphp_queue_create_object(zend_class_entry *ce) {
     zend_object_std_init(&obj->std, ce);
     object_properties_init(&obj->std, ce);
     new (&obj->queues) std::unordered_map<std::string, std::vector<zval>>();
+    ZVAL_UNDEF(&obj->client);
+    obj->has_client = false;
     obj->std.handlers = &kislayphp_queue_handlers;
     return &obj->std;
 }
 
 static void kislayphp_queue_free_obj(zend_object *object) {
     php_kislayphp_queue_t *obj = php_kislayphp_queue_from_obj(object);
+    if (obj->has_client) {
+        zval_ptr_dtor(&obj->client);
+    }
     for (auto &entry : obj->queues) {
         for (auto &item : entry.second) {
             zval_ptr_dtor(&item);
@@ -61,8 +116,38 @@ ZEND_BEGIN_ARG_INFO_EX(arginfo_kislayphp_queue_size, 0, 0, 1)
     ZEND_ARG_TYPE_INFO(0, queue, IS_STRING, 0)
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_INFO_EX(arginfo_kislayphp_queue_set_client, 0, 0, 1)
+    ZEND_ARG_OBJ_INFO(0, client, KislayPHP\\Queue\\ClientInterface, 0)
+ZEND_END_ARG_INFO()
+
 PHP_METHOD(KislayPHPQueue, __construct) {
     ZEND_PARSE_PARAMETERS_NONE();
+}
+
+PHP_METHOD(KislayPHPQueue, setClient) {
+    zval *client = nullptr;
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_ZVAL(client)
+    ZEND_PARSE_PARAMETERS_END();
+
+    if (client == nullptr || Z_TYPE_P(client) != IS_OBJECT) {
+        zend_throw_exception(zend_ce_exception, "Client must be an object", 0);
+        RETURN_FALSE;
+    }
+
+    if (!instanceof_function(Z_OBJCE_P(client), kislayphp_queue_client_ce)) {
+        zend_throw_exception(zend_ce_exception, "Client must implement KislayPHP\\Queue\\ClientInterface", 0);
+        RETURN_FALSE;
+    }
+
+    php_kislayphp_queue_t *obj = php_kislayphp_queue_from_obj(Z_OBJ_P(getThis()));
+    if (obj->has_client) {
+        zval_ptr_dtor(&obj->client);
+        obj->has_client = false;
+    }
+    ZVAL_COPY(&obj->client, client);
+    obj->has_client = true;
+    RETURN_TRUE;
 }
 
 PHP_METHOD(KislayPHPQueue, enqueue) {
@@ -75,6 +160,22 @@ PHP_METHOD(KislayPHPQueue, enqueue) {
     ZEND_PARSE_PARAMETERS_END();
 
     php_kislayphp_queue_t *obj = php_kislayphp_queue_from_obj(Z_OBJ_P(getThis()));
+    if (obj->has_client) {
+        zval queue_zv;
+        ZVAL_STRINGL(&queue_zv, queue, queue_len);
+
+        zval retval;
+        ZVAL_UNDEF(&retval);
+        zend_call_method_with_2_params(Z_OBJ(obj->client), Z_OBJCE(obj->client), nullptr, "enqueue", &retval, &queue_zv, payload);
+        zval_ptr_dtor(&queue_zv);
+
+        if (Z_ISUNDEF(retval)) {
+            RETURN_TRUE;
+        }
+        RETVAL_ZVAL(&retval, 1, 1);
+        return;
+    }
+
     zval copy;
     ZVAL_COPY(&copy, payload);
     obj->queues[std::string(queue, queue_len)].push_back(copy);
@@ -89,6 +190,22 @@ PHP_METHOD(KislayPHPQueue, dequeue) {
     ZEND_PARSE_PARAMETERS_END();
 
     php_kislayphp_queue_t *obj = php_kislayphp_queue_from_obj(Z_OBJ_P(getThis()));
+    if (obj->has_client) {
+        zval queue_zv;
+        ZVAL_STRINGL(&queue_zv, queue, queue_len);
+
+        zval retval;
+        ZVAL_UNDEF(&retval);
+        zend_call_method_with_1_params(Z_OBJ(obj->client), Z_OBJCE(obj->client), nullptr, "dequeue", &retval, &queue_zv);
+        zval_ptr_dtor(&queue_zv);
+
+        if (Z_ISUNDEF(retval)) {
+            RETURN_NULL();
+        }
+        RETVAL_ZVAL(&retval, 1, 1);
+        return;
+    }
+
     auto it = obj->queues.find(std::string(queue, queue_len));
     if (it == obj->queues.end() || it->second.empty()) {
         RETURN_NULL();
@@ -98,6 +215,7 @@ PHP_METHOD(KislayPHPQueue, dequeue) {
     ZVAL_COPY(return_value, &item);
     zval_ptr_dtor(&item);
     it->second.erase(it->second.begin());
+    return;
 }
 
 PHP_METHOD(KislayPHPQueue, size) {
@@ -108,6 +226,22 @@ PHP_METHOD(KislayPHPQueue, size) {
     ZEND_PARSE_PARAMETERS_END();
 
     php_kislayphp_queue_t *obj = php_kislayphp_queue_from_obj(Z_OBJ_P(getThis()));
+    if (obj->has_client) {
+        zval queue_zv;
+        ZVAL_STRINGL(&queue_zv, queue, queue_len);
+
+        zval retval;
+        ZVAL_UNDEF(&retval);
+        zend_call_method_with_1_params(Z_OBJ(obj->client), Z_OBJCE(obj->client), nullptr, "size", &retval, &queue_zv);
+        zval_ptr_dtor(&queue_zv);
+
+        if (Z_ISUNDEF(retval)) {
+            RETURN_LONG(0);
+        }
+        RETVAL_ZVAL(&retval, 1, 1);
+        return;
+    }
+
     auto it = obj->queues.find(std::string(queue, queue_len));
     if (it == obj->queues.end()) {
         RETURN_LONG(0);
@@ -117,14 +251,24 @@ PHP_METHOD(KislayPHPQueue, size) {
 
 static const zend_function_entry kislayphp_queue_methods[] = {
     PHP_ME(KislayPHPQueue, __construct, arginfo_kislayphp_queue_void, ZEND_ACC_PUBLIC)
+    PHP_ME(KislayPHPQueue, setClient, arginfo_kislayphp_queue_set_client, ZEND_ACC_PUBLIC)
     PHP_ME(KislayPHPQueue, enqueue, arginfo_kislayphp_queue_enqueue, ZEND_ACC_PUBLIC)
     PHP_ME(KislayPHPQueue, dequeue, arginfo_kislayphp_queue_dequeue, ZEND_ACC_PUBLIC)
     PHP_ME(KislayPHPQueue, size, arginfo_kislayphp_queue_size, ZEND_ACC_PUBLIC)
     PHP_FE_END
 };
 
+static const zend_function_entry kislayphp_queue_client_methods[] = {
+    ZEND_ABSTRACT_ME(KislayPHPQueueClientInterface, enqueue, arginfo_kislayphp_queue_enqueue)
+    ZEND_ABSTRACT_ME(KislayPHPQueueClientInterface, dequeue, arginfo_kislayphp_queue_dequeue)
+    ZEND_ABSTRACT_ME(KislayPHPQueueClientInterface, size, arginfo_kislayphp_queue_size)
+    PHP_FE_END
+};
+
 PHP_MINIT_FUNCTION(kislayphp_queue) {
     zend_class_entry ce;
+    INIT_NS_CLASS_ENTRY(ce, "KislayPHP\\Queue", "ClientInterface", kislayphp_queue_client_methods);
+    kislayphp_queue_client_ce = zend_register_internal_interface(&ce);
     INIT_NS_CLASS_ENTRY(ce, "KislayPHP\\Queue", "Queue", kislayphp_queue_methods);
     kislayphp_queue_ce = zend_register_internal_class(&ce);
     kislayphp_queue_ce->create_object = kislayphp_queue_create_object;
