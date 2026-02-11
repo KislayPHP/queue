@@ -9,6 +9,7 @@ extern "C" {
 #include "php_kislayphp_queue.h"
 
 #include <cstring>
+#include <pthread.h>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -61,10 +62,11 @@ static zend_class_entry *kislayphp_queue_ce;
 static zend_class_entry *kislayphp_queue_client_ce;
 
 typedef struct _php_kislayphp_queue_t {
-    zend_object std;
     std::unordered_map<std::string, std::vector<zval>> queues;
+    pthread_mutex_t lock;
     zval client;
     bool has_client;
+    zend_object std;
 } php_kislayphp_queue_t;
 
 static zend_object_handlers kislayphp_queue_handlers;
@@ -80,6 +82,7 @@ static zend_object *kislayphp_queue_create_object(zend_class_entry *ce) {
     zend_object_std_init(&obj->std, ce);
     object_properties_init(&obj->std, ce);
     new (&obj->queues) std::unordered_map<std::string, std::vector<zval>>();
+    pthread_mutex_init(&obj->lock, nullptr);
     ZVAL_UNDEF(&obj->client);
     obj->has_client = false;
     obj->std.handlers = &kislayphp_queue_handlers;
@@ -97,6 +100,7 @@ static void kislayphp_queue_free_obj(zend_object *object) {
         }
     }
     obj->queues.~unordered_map();
+    pthread_mutex_destroy(&obj->lock);
     zend_object_std_dtor(&obj->std);
 }
 
@@ -178,7 +182,9 @@ PHP_METHOD(KislayPHPQueue, enqueue) {
 
     zval copy;
     ZVAL_COPY(&copy, payload);
+    pthread_mutex_lock(&obj->lock);
     obj->queues[std::string(queue, queue_len)].push_back(copy);
+    pthread_mutex_unlock(&obj->lock);
     RETURN_TRUE;
 }
 
@@ -206,8 +212,10 @@ PHP_METHOD(KislayPHPQueue, dequeue) {
         return;
     }
 
+    pthread_mutex_lock(&obj->lock);
     auto it = obj->queues.find(std::string(queue, queue_len));
     if (it == obj->queues.end() || it->second.empty()) {
+        pthread_mutex_unlock(&obj->lock);
         RETURN_NULL();
     }
 
@@ -215,6 +223,7 @@ PHP_METHOD(KislayPHPQueue, dequeue) {
     ZVAL_COPY(return_value, &item);
     zval_ptr_dtor(&item);
     it->second.erase(it->second.begin());
+    pthread_mutex_unlock(&obj->lock);
     return;
 }
 
@@ -242,11 +251,15 @@ PHP_METHOD(KislayPHPQueue, size) {
         return;
     }
 
+    pthread_mutex_lock(&obj->lock);
     auto it = obj->queues.find(std::string(queue, queue_len));
     if (it == obj->queues.end()) {
+        pthread_mutex_unlock(&obj->lock);
         RETURN_LONG(0);
     }
-    RETURN_LONG(static_cast<zend_long>(it->second.size()));
+    zend_long count = static_cast<zend_long>(it->second.size());
+    pthread_mutex_unlock(&obj->lock);
+    RETURN_LONG(count);
 }
 
 static const zend_function_entry kislayphp_queue_methods[] = {

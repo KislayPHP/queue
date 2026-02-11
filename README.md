@@ -29,7 +29,21 @@ PHP queue, in-memory queue, job queue, background jobs, C++ PHP extension, micro
 - https://github.com/KislayPHP/config
 - https://github.com/KislayPHP/metrics
 
-## Build
+## Installation
+
+### Via PECL
+
+```bash
+pecl install kislayphp_queue
+```
+
+Then add to your php.ini:
+
+```ini
+extension=kislayphp_queue.so
+```
+
+### Manual Build
 
 ```sh
 phpize
