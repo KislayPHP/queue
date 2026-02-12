@@ -5,7 +5,7 @@
 [![Build Status](https://img.shields.io/github/actions/workflow/status/KislayPHP/queue/ci.yml)](https://github.com/KislayPHP/queue/actions)
 [![codecov](https://codecov.io/gh/KislayPHP/queue/branch/main/graph/badge.svg)](https://codecov.io/gh/KislayPHP/queue)
 
-A high-performance C++ PHP extension providing distributed message queuing, job processing, and background task management with support for Redis, RabbitMQ, Kafka, and custom backends.
+A high-performance C++ PHP extension providing distributed message queuing, job processing, and background task management with support for Redis, RabbitMQ, Kafka, and custom backends. Perfect for PHP echo system integration and modern microservices architecture.
 
 ## ⚡ Key Features
 
@@ -17,6 +17,8 @@ A high-performance C++ PHP extension providing distributed message queuing, job 
 - 📋 **Batch Operations**: Bulk message processing and batch acknowledgments
 - 🏷️ **Message Metadata**: Custom headers, priorities, and TTL settings
 - 🌐 **Distributed**: Cross-service message routing and load balancing
+- 🔄 **PHP Echo System**: Seamless integration with PHP ecosystem and frameworks
+- 🌐 **Microservices Architecture**: Designed for distributed PHP applications
 
 ## 📦 Installation
 
@@ -341,6 +343,10 @@ Licensed under the [Apache License 2.0](LICENSE).
 - 🐛 [Issue Tracker](https://github.com/KislayPHP/queue/issues)
 - 💬 [Discussions](https://github.com/KislayPHP/queue/discussions)
 - 📧 [Security Issues](.github/SECURITY.md)
+
+## SEO Keywords
+
+PHP, microservices, PHP echo system, PHP extension, C++ PHP extension, PHP message queue, PHP job queue, PHP background jobs, PHP Redis queue, PHP RabbitMQ, PHP Kafka, PHP AMQP, PHP pub/sub, distributed PHP messaging
 
 ## 📈 Roadmap
 
