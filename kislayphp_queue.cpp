@@ -124,6 +124,10 @@ ZEND_BEGIN_ARG_INFO_EX(arginfo_kislayphp_queue_set_client, 0, 0, 1)
     ZEND_ARG_OBJ_INFO(0, client, KislayPHP\\Queue\\ClientInterface, 0)
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_INFO_EX(arginfo_kislayphp_queue_clear, 0, 0, 1)
+    ZEND_ARG_TYPE_INFO(0, queue, IS_STRING, 0)
+ZEND_END_ARG_INFO()
+
 PHP_METHOD(KislayPHPQueue, __construct) {
     ZEND_PARSE_PARAMETERS_NONE();
 }
@@ -262,12 +266,87 @@ PHP_METHOD(KislayPHPQueue, size) {
     RETURN_LONG(count);
 }
 
+PHP_METHOD(KislayPHPQueue, peek) {
+    char *queue = nullptr;
+    size_t queue_len = 0;
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_STRING(queue, queue_len)
+    ZEND_PARSE_PARAMETERS_END();
+
+    php_kislayphp_queue_t *obj = php_kislayphp_queue_from_obj(Z_OBJ_P(getThis()));
+    if (obj->has_client) {
+        zval queue_zv;
+        ZVAL_STRINGL(&queue_zv, queue, queue_len);
+
+        zval retval;
+        ZVAL_UNDEF(&retval);
+        zend_call_method_with_1_params(Z_OBJ(obj->client), Z_OBJCE(obj->client), nullptr, "dequeue", &retval, &queue_zv);
+        zval_ptr_dtor(&queue_zv);
+
+        if (Z_ISUNDEF(retval)) {
+            RETURN_NULL();
+        }
+        RETVAL_ZVAL(&retval, 1, 1);
+        return;
+    }
+
+    pthread_mutex_lock(&obj->lock);
+    auto it = obj->queues.find(std::string(queue, queue_len));
+    if (it == obj->queues.end() || it->second.empty()) {
+        pthread_mutex_unlock(&obj->lock);
+        RETURN_NULL();
+    }
+    zval &item = it->second.front();
+    ZVAL_COPY(return_value, &item);
+    pthread_mutex_unlock(&obj->lock);
+}
+
+PHP_METHOD(KislayPHPQueue, clear) {
+    char *queue = nullptr;
+    size_t queue_len = 0;
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_STRING(queue, queue_len)
+    ZEND_PARSE_PARAMETERS_END();
+
+    php_kislayphp_queue_t *obj = php_kislayphp_queue_from_obj(Z_OBJ_P(getThis()));
+    if (obj->has_client) {
+        zval queue_zv;
+        ZVAL_STRINGL(&queue_zv, queue, queue_len);
+        zval count_zv;
+        ZVAL_LONG(&count_zv, 0);
+
+        zval retval;
+        ZVAL_UNDEF(&retval);
+        zend_call_method_with_2_params(Z_OBJ(obj->client), Z_OBJCE(obj->client), nullptr, "enqueue", &retval, &queue_zv, &count_zv);
+        zval_ptr_dtor(&queue_zv);
+        if (!Z_ISUNDEF(retval)) {
+            zval_ptr_dtor(&retval);
+        }
+        RETURN_TRUE;
+    }
+
+    zend_long removed = 0;
+    pthread_mutex_lock(&obj->lock);
+    auto it = obj->queues.find(std::string(queue, queue_len));
+    if (it != obj->queues.end()) {
+        removed = static_cast<zend_long>(it->second.size());
+        for (auto &item : it->second) {
+            zval_ptr_dtor(&item);
+        }
+        obj->queues.erase(it);
+    }
+    pthread_mutex_unlock(&obj->lock);
+    RETURN_LONG(removed);
+}
+
 static const zend_function_entry kislayphp_queue_methods[] = {
     PHP_ME(KislayPHPQueue, __construct, arginfo_kislayphp_queue_void, ZEND_ACC_PUBLIC)
     PHP_ME(KislayPHPQueue, setClient, arginfo_kislayphp_queue_set_client, ZEND_ACC_PUBLIC)
     PHP_ME(KislayPHPQueue, enqueue, arginfo_kislayphp_queue_enqueue, ZEND_ACC_PUBLIC)
     PHP_ME(KislayPHPQueue, dequeue, arginfo_kislayphp_queue_dequeue, ZEND_ACC_PUBLIC)
+    PHP_ME(KislayPHPQueue, peek, arginfo_kislayphp_queue_dequeue, ZEND_ACC_PUBLIC)
     PHP_ME(KislayPHPQueue, size, arginfo_kislayphp_queue_size, ZEND_ACC_PUBLIC)
+    PHP_ME(KislayPHPQueue, clear, arginfo_kislayphp_queue_clear, ZEND_ACC_PUBLIC)
     PHP_FE_END
 };
 

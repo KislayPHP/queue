@@ -30,6 +30,10 @@
     "require": {
         "php": ">=8.2"
     },
+    "scripts": {
+        "lint": "php -n -l example.php",
+        "validate-json": "php -n -r \"json_decode(file_get_contents('composer.json')); if (json_last_error()) { fwrite(STDERR, json_last_error_msg() . PHP_EOL); exit(1); } echo 'composer.json OK' . PHP_EOL;\""
+    },
     "provide": {
         "ext-kislayphp_queue": "*"
     },

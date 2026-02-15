@@ -2,7 +2,14 @@
 // Run from this folder with:
 // php -d extension=modules/kislayphp_queue.so example.php
 
-extension_loaded('kislayphp_queue') or die('kislayphp_queue not loaded');
+function fail(string $message): void {
+	echo "FAIL: {$message}\n";
+	exit(1);
+}
+
+if (!extension_loaded('kislayphp_queue')) {
+	fail('kislayphp_queue not loaded');
+}
 
 $queue = new KislayPHP\Queue\Queue();
 
@@ -26,13 +33,24 @@ class ArrayQueueClient implements KislayPHP\Queue\ClientInterface {
 	}
 }
 
-$use_client = false;
-if ($use_client) {
-	$queue->setClient(new ArrayQueueClient());
-}
+$queue->setClient(new ArrayQueueClient());
+
 $queue->enqueue('jobs', ['id' => 1, 'task' => 'email']);
 $queue->enqueue('jobs', ['id' => 2, 'task' => 'sms']);
 
-var_dump($queue->size('jobs'));
-var_dump($queue->dequeue('jobs'));
-var_dump($queue->size('jobs'));
+$sizeBefore = $queue->size('jobs');
+if ($sizeBefore !== 2) {
+	fail('size before dequeue mismatch');
+}
+
+$job = $queue->dequeue('jobs');
+if (!is_array($job) || ($job['id'] ?? null) !== 1) {
+	fail('dequeue returned unexpected payload');
+}
+
+$sizeAfter = $queue->size('jobs');
+if ($sizeAfter !== 1) {
+	fail('size after dequeue mismatch');
+}
+
+echo "OK: queue example passed\n";
