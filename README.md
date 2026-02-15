@@ -22,10 +22,10 @@ A high-performance C++ PHP extension providing distributed message queuing, job 
 
 ## 📦 Installation
 
-### Via PECL (Recommended)
+### Via PIE (Recommended)
 
 ```bash
-pecl install kislayphp_queue
+pie install kislayphp/queue
 ```
 
 Add to your `php.ini`:
@@ -49,7 +49,6 @@ sudo make install
 
 ```dockerfile
 FROM php:8.2-cli
-RUN pecl install kislayphp_queue && docker-php-ext-enable kislayphp_queue
 ```
 
 ## 🚀 Quick Start

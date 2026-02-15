@@ -22,9 +22,9 @@ The extension uses a pluggable storage interface:
 
 ## Installation
 
-### Via PECL
+### Via PIE
 ```bash
-pecl install kislayphp_queue
+pie install kislayphp/queue
 ```
 
 ### Manual Build
