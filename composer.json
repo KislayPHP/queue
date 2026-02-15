@@ -7,7 +7,7 @@
         "php",
         "microservices",
         "php-extension",
-        "c++-extension",
+        "cpp-extension",
         "php-message-queue",
         "php-job-queue",
         "php-background-jobs",
