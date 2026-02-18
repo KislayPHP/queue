@@ -15,7 +15,7 @@ The KislayPHP Queue extension provides high-performance, in-memory message queui
 ### Storage Backends
 The extension uses a pluggable storage interface:
 - In-memory storage (default)
-- Redis backend
+- KV store backend
 - Database backend (MySQL/PostgreSQL)
 - File-based storage
 - Custom implementations
@@ -424,15 +424,15 @@ $app->get('/process-jobs', function($req, $res) use ($processor) {
 
 ## Storage Backends
 
-### Redis Backend
+### KV store Backend
 ```php
 <?php
-class RedisQueueStorage implements KislayPHP\\Queue\\StorageInterface {
-    private $redis;
+class KeyValueStoreQueueStorage implements KislayPHP\\Queue\\StorageInterface {
+    private $KV store;
 
     public function __construct(string $host = 'localhost', int $port = 6379) {
-        $this->redis = new Redis();
-        $this->redis->connect($host, $port);
+        $this->KV store = new KV store();
+        $this->KV store->connect($host, $port);
     }
 
     public function push(string $queueName, string $message, array $options = []): bool {
@@ -442,15 +442,15 @@ class RedisQueueStorage implements KislayPHP\\Queue\\StorageInterface {
             // Use sorted set for priority queue
             $priority = $options['priority'];
             $timestamp = isset($options['delay']) ? time() + $options['delay'] : time();
-            return $this->redis->zAdd($key, $priority, $message) !== false;
+            return $this->KV store->zAdd($key, $priority, $message) !== false;
         } else {
             // Use list for FIFO queue
             if (isset($options['delay'])) {
                 // Delayed message - use sorted set with timestamp
                 $deliverAt = time() + $options['delay'];
-                return $this->redis->zAdd($key, $deliverAt, $message) !== false;
+                return $this->KV store->zAdd($key, $deliverAt, $message) !== false;
             } else {
-                return $this->redis->lPush($key, $message) !== false;
+                return $this->KV store->lPush($key, $message) !== false;
             }
         }
     }
@@ -459,38 +459,38 @@ class RedisQueueStorage implements KislayPHP\\Queue\\StorageInterface {
         $key = "queue:{$queueName}";
 
         // Check if it's a priority/delayed queue (sorted set)
-        $cardinality = $this->redis->zCard($key);
+        $cardinality = $this->KV store->zCard($key);
         if ($cardinality > 0) {
             // Get the highest priority item ready for delivery
-            $items = $this->redis->zRangeByScore($key, 0, time(), ['limit' => [0, 1]]);
+            $items = $this->KV store->zRangeByScore($key, 0, time(), ['limit' => [0, 1]]);
             if (!empty($items)) {
                 $message = $items[0];
-                $this->redis->zRem($key, $message);
+                $this->KV store->zRem($key, $message);
                 return $message;
             }
             return null;
         } else {
             // Regular FIFO queue
-            return $this->redis->rPop($key);
+            return $this->KV store->rPop($key);
         }
     }
 
     public function size(string $queueName): int {
         $key = "queue:{$queueName}";
-        $zcard = $this->redis->zCard($key);
-        return $zcard > 0 ? $zcard : $this->redis->lLen($key);
+        $zcard = $this->KV store->zCard($key);
+        return $zcard > 0 ? $zcard : $this->KV store->lLen($key);
     }
 
     public function clear(string $queueName): bool {
         $key = "queue:{$queueName}";
-        return $this->redis->del($key) !== false;
+        return $this->KV store->del($key) !== false;
     }
 }
 
 // Usage
 $queueManager = new QueueManager();
-$redisStorage = new RedisQueueStorage('redis-server', 6379);
-$queueManager->setStorage($redisStorage);
+$kvStorage = new KeyValueStoreQueueStorage('kv-store', 6379);
+$queueManager->setStorage($kvStorage);
 ```
 
 ### Database Backend
@@ -741,17 +741,17 @@ class EncryptedMessageSerializer implements MessageSerializer {
 
     public function serialize($message): string {
         $data = json_encode($message);
-        $iv = openssl_random_pseudo_bytes(openssl_cipher_iv_length($this->cipher));
-        $encrypted = openssl_encrypt($data, $this->cipher, $this->key, 0, $iv);
+        $iv = crypto_random_pseudo_bytes(crypto_cipher_iv_length($this->cipher));
+        $encrypted = crypto_encrypt($data, $this->cipher, $this->key, 0, $iv);
         return base64_encode($iv . $encrypted);
     }
 
     public function deserialize(string $message) {
         $data = base64_decode($message);
-        $ivLength = openssl_cipher_iv_length($this->cipher);
+        $ivLength = crypto_cipher_iv_length($this->cipher);
         $iv = substr($data, 0, $ivLength);
         $encrypted = substr($data, $ivLength);
-        $decrypted = openssl_decrypt($encrypted, $this->cipher, $this->key, 0, $iv);
+        $decrypted = crypto_decrypt($encrypted, $this->cipher, $this->key, 0, $iv);
         return json_decode($decrypted, true);
     }
 }
@@ -1129,7 +1129,7 @@ $batchProcessor->processBatch(function($batch) {
 
 ## Integration Examples
 
-### Laravel Queue Integration
+### KislayPHP Queue Integration
 ```php
 <?php
 // config/queue.php
@@ -1207,11 +1207,11 @@ class KislayPHPQueue extends Illuminate\\Queue\\Queue implements Illuminate\\Con
 }
 ```
 
-### Symfony Messenger Integration
+### Framework Message Bus Integration
 ```php
 <?php
 // src/Messenger/Transport/KislayPHPTransport.php
-class KislayPHPTransport implements Symfony\\Component\\Messenger\\Transport\\TransportInterface {
+class KislayPHPTransport implements Framework\\Component\\Messenger\\Transport\\TransportInterface {
     private $queueManager;
     private $queueName;
 
@@ -1233,17 +1233,17 @@ class KislayPHPTransport implements Symfony\\Component\\Messenger\\Transport\\Tr
         return [$envelope];
     }
 
-    public function ack(Symfony\\Component\\Messenger\\Envelope $envelope): void {
+    public function ack(Framework\\Component\\Messenger\\Envelope $envelope): void {
         // KislayPHP queues auto-remove messages on pop, so no explicit ack needed
     }
 
-    public function reject(Symfony\\Component\\Messenger\\Envelope $envelope): void {
+    public function reject(Framework\\Component\\Messenger\\Envelope $envelope): void {
         // Put back in queue for retry
         $queue = $this->queueManager->getQueue($this->queueName);
         $queue->push(serialize($envelope));
     }
 
-    public function send(Symfony\\Component\\Messenger\\Envelope $envelope): void {
+    public function send(Framework\\Component\\Messenger\\Envelope $envelope): void {
         $queue = $this->queueManager->getQueue($this->queueName);
         $queue->push(serialize($envelope));
     }
@@ -1427,7 +1427,7 @@ class QueueIntegrationTest extends TestCase {
 
 **Solutions:**
 1. Implement message batching
-2. Use external storage backends (Redis, Database)
+2. Use external storage backends (KV store, Database)
 3. Monitor queue depth and implement backpressure
 4. Clear processed messages promptly
 

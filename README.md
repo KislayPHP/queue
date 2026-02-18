@@ -5,19 +5,19 @@
 [![Build Status](https://img.shields.io/github/actions/workflow/status/KislayPHP/queue/ci.yml)](https://github.com/KislayPHP/queue/actions)
 [![codecov](https://codecov.io/gh/KislayPHP/queue/branch/main/graph/badge.svg)](https://codecov.io/gh/KislayPHP/queue)
 
-A high-performance C++ PHP extension providing distributed message queuing, job processing, and background task management with support for Redis, RabbitMQ, Kafka, and custom backends. Perfect for PHP echo system integration and modern microservices architecture.
+A high-performance C++ PHP extension providing distributed message queuing, job processing, and background task management with support for KV store, RabbitMQ, Kafka, and custom backends. Perfect for PHP ecosystem integration and modern microservices architecture.
 
 ## ⚡ Key Features
 
 - 🚀 **High Performance**: Ultra-fast message enqueue/dequeue operations
-- 📨 **Multiple Protocols**: Support for AMQP, Redis, Kafka, and SQS
+- 📨 **Multiple Protocols**: Support for AMQP, KV store, Kafka, and SQS
 - 🔄 **Message Patterns**: Queue, pub/sub, request-reply, and delayed messages
 - 📊 **Monitoring**: Queue metrics, throughput tracking, and error handling
 - 🔄 **Retry Logic**: Configurable retry policies and dead letter queues
 - 📋 **Batch Operations**: Bulk message processing and batch acknowledgments
 - 🏷️ **Message Metadata**: Custom headers, priorities, and TTL settings
 - 🌐 **Distributed**: Cross-service message routing and load balancing
-- 🔄 **PHP Echo System**: Seamless integration with PHP ecosystem and frameworks
+- 🔄 **PHP Ecosystem**: Seamless integration with PHP ecosystem and frameworks
 - 🌐 **Microservices Architecture**: Designed for distributed PHP applications
 
 ## 📦 Installation
@@ -45,9 +45,9 @@ make
 sudo make install
 ```
 
-### Docker
+### container
 
-```dockerfile
+```containerfile
 FROM php:8.2-cli
 ```
 
@@ -138,14 +138,14 @@ while ($message = $subscription->getMessage()) {
 
 $queue = new KislayQueue();
 
-// Redis backend
-$redis = new RedisQueue([
-    'host' => 'redis-server',
+// KV store backend
+$KV store = new KV storeQueue([
+    'host' => 'kv-store',
     'port' => 6379,
     'password' => 'secret',
     'database' => 1
 ]);
-$queue->setBackend($redis);
+$queue->setBackend($KV store);
 
 // RabbitMQ backend
 $rabbitmq = new RabbitMQQueue([
@@ -249,7 +249,7 @@ KislayPHP Queue implements a layered messaging architecture:
     ┌─────────────┐
     │ Message     │
     │ Brokers     │
-    │ (Redis/RMQ/ │
+    │ (KV store/RMQ/ │
     │  Kafka...)  │
     └─────────────┘
 ```
@@ -288,9 +288,9 @@ kislayphp.queue.message_timeout = 300
 kislayphp.queue.batch_size = 100
 kislayphp.queue.retry_attempts = 3
 
-; Redis settings
-kislayphp.queue.redis_host = "localhost"
-kislayphp.queue.redis_port = 6379
+; KV store settings
+kislayphp.queue.kv_host = "localhost"
+kislayphp.queue.kv_port = 6379
 
 ; RabbitMQ settings
 kislayphp.queue.rabbitmq_host = "localhost"
@@ -303,8 +303,8 @@ kislayphp.queue.kafka_brokers = "localhost:9092"
 ### Environment Variables
 
 ```bash
-export KISLAYPHP_QUEUE_BACKEND=redis
-export KISLAYPHP_QUEUE_REDIS_HOST=redis-server:6379
+export KISLAYPHP_QUEUE_BACKEND=KV store
+export KISLAYPHP_QUEUE_KV_HOST=kv-store:6379
 export KISLAYPHP_QUEUE_RABBITMQ_HOST=rabbitmq:5672
 export KISLAYPHP_QUEUE_KAFKA_BROKERS=kafka:9092
 export KISLAYPHP_QUEUE_MAX_CONNECTIONS=100
@@ -322,7 +322,7 @@ cd tests/
 php test_queue_operations.php
 
 # Test backend integration
-php test_redis_backend.php
+php test_kv_backend.php
 
 # Performance tests
 php test_throughput.php
@@ -345,7 +345,7 @@ Licensed under the [Apache License 2.0](LICENSE).
 
 ## SEO Keywords
 
-PHP, microservices, PHP echo system, PHP extension, C++ PHP extension, PHP message queue, PHP job queue, PHP background jobs, PHP Redis queue, PHP RabbitMQ, PHP Kafka, PHP AMQP, PHP pub/sub, distributed PHP messaging
+PHP, microservices, PHP ecosystem, PHP extension, C++ PHP extension, PHP message queue, PHP job queue, PHP background jobs, PHP KV store queue, PHP RabbitMQ, PHP Kafka, PHP AMQP, PHP pub/sub, distributed PHP messaging
 
 ## 📈 Roadmap
 
@@ -358,7 +358,7 @@ PHP, microservices, PHP echo system, PHP extension, C++ PHP extension, PHP messa
 
 ## 🙏 Acknowledgments
 
-- **Redis**: In-memory data structure store
+- **KV store**: In-memory data structure store
 - **RabbitMQ**: Message broker
 - **Apache Kafka**: Event streaming platform
 - **PHP**: Zend API for extension development
