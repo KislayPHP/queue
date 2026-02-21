@@ -11,9 +11,9 @@ if (!extension_loaded('kislayphp_queue')) {
 	fail('kislayphp_queue not loaded');
 }
 
-$queue = new KislayPHP\Queue\Queue();
+$queue = new Kislay\Queue\Queue();
 
-class ArrayQueueClient implements KislayPHP\Queue\ClientInterface {
+class ArrayQueueClient implements Kislay\Queue\ClientInterface {
 	private array $queues = [];
 
 	public function enqueue(string $queue, mixed $payload): bool {

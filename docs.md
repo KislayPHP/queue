@@ -1,5 +1,8 @@
 # KislayPHP Queue Extension Documentation
 
+Primary namespace is `Kislay\Queue` with backward-compatible aliases under `KislayPHP\Queue`.
+See `SERVICE_COMMUNICATION.md` for inter-service communication patterns.
+
 ## Overview
 
 The KislayPHP Queue extension provides high-performance, in-memory message queuing capabilities with support for pub/sub patterns, persistent queues, and pluggable storage backends. It supports multiple queue types including FIFO, priority queues, and delayed message delivery.

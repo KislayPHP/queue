@@ -365,7 +365,7 @@ ZEND_BEGIN_ARG_INFO_EX(arginfo_kislayphp_queue_size, 0, 0, 1)
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_INFO_EX(arginfo_kislayphp_queue_set_client, 0, 0, 1)
-    ZEND_ARG_OBJ_INFO(0, client, KislayPHP\\Queue\\ClientInterface, 0)
+    ZEND_ARG_OBJ_INFO(0, client, Kislay\\Queue\\ClientInterface, 0)
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_INFO_EX(arginfo_kislayphp_queue_clear, 0, 0, 1)
@@ -388,7 +388,7 @@ PHP_METHOD(KislayPHPQueue, setClient) {
     }
 
     if (!instanceof_function(Z_OBJCE_P(client), kislayphp_queue_client_ce)) {
-        zend_throw_exception(zend_ce_exception, "Client must implement KislayPHP\\Queue\\ClientInterface", 0);
+        zend_throw_exception(zend_ce_exception, "Client must implement Kislay\\Queue\\ClientInterface", 0);
         RETURN_FALSE;
     }
 
@@ -667,10 +667,13 @@ static const zend_function_entry kislayphp_queue_client_methods[] = {
 
 PHP_MINIT_FUNCTION(kislayphp_queue) {
     zend_class_entry ce;
-    INIT_NS_CLASS_ENTRY(ce, "KislayPHP\\Queue", "ClientInterface", kislayphp_queue_client_methods);
+    INIT_NS_CLASS_ENTRY(ce, "Kislay\\Queue", "ClientInterface", kislayphp_queue_client_methods);
     kislayphp_queue_client_ce = zend_register_internal_interface(&ce);
-    INIT_NS_CLASS_ENTRY(ce, "KislayPHP\\Queue", "Queue", kislayphp_queue_methods);
+    zend_register_class_alias("KislayPHP\\Queue\\ClientInterface", kislayphp_queue_client_ce);
+
+    INIT_NS_CLASS_ENTRY(ce, "Kislay\\Queue", "Queue", kislayphp_queue_methods);
     kislayphp_queue_ce = zend_register_internal_class(&ce);
+    zend_register_class_alias("KislayPHP\\Queue\\Queue", kislayphp_queue_ce);
     kislayphp_queue_ce->create_object = kislayphp_queue_create_object;
     std::memcpy(&kislayphp_queue_handlers, zend_get_std_object_handlers(), sizeof(zend_object_handlers));
     kislayphp_queue_handlers.offset = XtOffsetOf(php_kislayphp_queue_t, std);

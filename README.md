@@ -7,6 +7,9 @@
 
 A high-performance C++ PHP extension providing distributed message queuing, job processing, and background task management with support for KV store, RabbitMQ, Kafka, and custom backends. Perfect for PHP ecosystem integration and modern microservices architecture.
 
+Primary runtime namespace is `Kislay\Queue` (legacy `KislayPHP\Queue` aliases are kept for compatibility).
+For service-to-service patterns, see `SERVICE_COMMUNICATION.md` and `service_communication.php`.
+
 ## ⚡ Key Features
 
 - 🚀 **High Performance**: Ultra-fast message enqueue/dequeue operations
