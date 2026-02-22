@@ -221,6 +221,8 @@ try {
 ## 📚 Documentation
 
 📖 **[Complete Documentation](docs.md)** - API reference, backend configurations, message patterns, and deployment guides
+- 📘 **[Class Reference](CLASS_REFERENCE.md)** - Queue classes and method-by-method behavior
+- 🚀 **[Deployment Guide](https://github.com/KislayPHP/core/blob/main/docs/DEPLOYMENT_GUIDE_MULTI_ENV.md)** - Docker/AWS/cloud/on-prem runbook
 
 ## 🏗️ Architecture
 
