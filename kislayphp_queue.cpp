@@ -705,11 +705,12 @@ zend_module_entry kislayphp_queue_module_entry = {
     STANDARD_MODULE_PROPERTIES
 };
 
-#if defined(COMPILE_DL_KISLAYPHP_QUEUE) || defined(ZEND_COMPILE_DL_EXT)
 #ifdef ZTS
 ZEND_TSRMLS_CACHE_DEFINE();
 #endif
+
 extern "C" {
-ZEND_GET_MODULE(kislayphp_queue)
+ZEND_DLEXPORT zend_module_entry *get_module(void) {
+    return &kislayphp_queue_module_entry;
 }
-#endif
+}

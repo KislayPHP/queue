@@ -28,7 +28,7 @@ For service-to-service patterns, see `SERVICE_COMMUNICATION.md` and `service_com
 ### Via PIE (Recommended)
 
 ```bash
-pie install kislayphp/queue
+pie install kislayphp/queue:0.0.2
 ```
 
 Add to your `php.ini`:
