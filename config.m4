@@ -3,6 +3,7 @@ PHP_ARG_ENABLE(kislayphp_queue, whether to enable kislayphp_queue,
 
 if test "$PHP_KISLAYPHP_QUEUE" != "no"; then
   PHP_REQUIRE_CXX()
+  PHP_ADD_LIBRARY(stdc++,, KISLAYPHP_QUEUE_SHARED_LIBADD)
   if test -f ../rpc/gen/platform.pb.cc; then
     RPC_GEN_DIR=`pwd`/../rpc/gen
     PHP_ADD_INCLUDE($RPC_GEN_DIR)
@@ -18,4 +19,5 @@ if test "$PHP_KISLAYPHP_QUEUE" != "no"; then
   fi
 
   PHP_NEW_EXTENSION(kislayphp_queue, kislayphp_queue.cpp $RPC_SRCS, $ext_shared)
+  PHP_SUBST(KISLAYPHP_QUEUE_SHARED_LIBADD)
 fi
