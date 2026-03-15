@@ -1,25 +1,11 @@
-# Release Guide
+# Release Notes
 
-## Pre-publish checks
+## 0.0.4
 
-Run from repository root:
-
-```bash
-chmod +x scripts/release_check.sh
-./scripts/release_check.sh
-```
-
-## Build extension artifact
-
-```bash
-phpize
-./configure
-make -j4
-```
-
-## Publish checklist
-
-- Confirm `README.md`, `composer.json`, and `package.xml` are up to date.
-- Confirm `package.xml` release and API versions are set correctly.
-- Confirm examples pass `php -n -l`.
-- Tag release and push tag to origin.
+- added standalone `Kislay\Queue\Server`
+- added remote `Kislay\Queue\Client`
+- added `Kislay\Queue\Worker`
+- added `Kislay\Queue\Job`
+- added queue leasing, retries, delayed jobs, and DLQ routing
+- kept legacy local `Kislay\Queue\Queue` for development fallback
+- documented the current limitation that queue state is still in-memory only

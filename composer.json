@@ -1,6 +1,6 @@
 {
     "name": "kislayphp/queue",
-    "description": "High-performance C++ PHP extension providing distributed message queuing and job processing for PHP microservices",
+    "description": "Native PHP distributed job queue with a standalone queue server, producer client, worker runtime, retries, and DLQ support",
     "type": "php-ext",
     "license": "Apache-2.0",
     "keywords": [
@@ -8,16 +8,12 @@
         "microservices",
         "php-extension",
         "cpp-extension",
-        "php-message-queue",
         "php-job-queue",
         "php-background-jobs",
-        "php-redis-queue",
-        "php-rabbitmq",
-        "php-kafka",
-        "php-amqp",
-        "php-pub-sub",
-        "distributed-messaging",
-        "php-echo-system",
+        "distributed-job-queue",
+        "dead-letter-queue",
+        "delayed-jobs",
+        "at-least-once-delivery",
         "php-async-processing"
     ],
     "homepage": "https://github.com/KislayPHP/queue",

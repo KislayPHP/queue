@@ -6,25 +6,25 @@
          xsi:schemaLocation="http://pear.php.net/dtd/package-2.0 http://pear.php.net/dtd/package-2.0.xsd">
   <name>kislayphp_queue</name>
   <channel>pecl.php.net</channel>
-  <summary>KislayPHP Queue provides a simple queue interface.</summary>
-  <description>KislayPHP Queue provides a simple queue interface. Part of the KislayPHP suite.</description>
+  <summary>Kislay Queue provides a distributed queue server, client, and worker runtime.</summary>
+  <description>Kislay Queue provides a standalone queue server, producer client, worker client, retries, delayed jobs, and DLQ support. Part of the KislayPHP suite.</description>
   <lead>
     <name>kislay kumar</name>
     <user>kislaykumar</user>
     <email>kislayraj.89@gmail.com</email>
     <active>yes</active>
   </lead>
-  <date>2026-03-01</date>
+  <date>2026-03-16</date>
   <version>
-    <release>0.0.3</release>
-    <api>0.0.3</api>
+    <release>0.0.4</release>
+    <api>0.0.4</api>
   </version>
   <stability>
     <release>beta</release>
     <api>beta</api>
   </stability>
   <license>Apache-2.0</license>
-  <notes>Release 0.0.3.</notes>
+  <notes>Release 0.0.4.</notes>
   <contents>
     <dir name="/">
       <file name="*" role="src" />
