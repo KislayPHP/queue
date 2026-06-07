@@ -24,10 +24,15 @@ extern "C" {
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <pthread.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <atomic>
+#include <mutex>
+#include <thread>
+#include <deque>
 
 #include "Zend/zend_smart_str.h"
 #include "ext/standard/php_var.h"
@@ -199,7 +204,7 @@ typedef struct _php_kislayphp_queue_client_t {
 
 typedef struct _php_kislayphp_queue_worker_t {
     std::string base_url;
-    bool stop_requested;
+    std::atomic<bool> stop_requested{false};  // atomic: stop() called from another thread
     zend_object std;
 } php_kislayphp_queue_worker_t;
 
@@ -397,6 +402,108 @@ static bool kislay_parse_http_url(const std::string &url, kislay_http_url_t *par
     return !parsed->host.empty();
 }
 
+
+// ─────────────────────────────────────────────────────────────────────────────
+// HTTP connection pool — reuse TCP sockets across requests to the same host:port
+// instead of creating a new socket per operation (the biggest perf gap).
+// Pool is thread_local to avoid locking; each worker thread has its own pool.
+// ─────────────────────────────────────────────────────────────────────────────
+struct KislayPooledSocket {
+    int fd;
+    std::chrono::steady_clock::time_point last_used;
+};
+
+class KislayHttpPool {
+public:
+    static KislayHttpPool& get() {
+        static thread_local KislayHttpPool instance;
+        return instance;
+    }
+
+    ~KislayHttpPool() { clear(); }
+
+    // Acquire an existing connected socket or return -1
+    int acquire(const std::string &host, int port) {
+        std::string key = host + ":" + std::to_string(port);
+        auto it = pool_.find(key);
+        if (it == pool_.end() || it->second.empty()) return -1;
+
+        auto &q = it->second;
+        while (!q.empty()) {
+            auto ps = std::move(q.back());
+            q.pop_back();
+            // Idle timeout: 30 seconds
+            auto age = std::chrono::steady_clock::now() - ps.last_used;
+            if (std::chrono::duration_cast<std::chrono::seconds>(age).count() > 30) {
+                close(ps.fd);
+                continue;
+            }
+            // Quick liveness check with MSG_PEEK
+            char buf;
+            ssize_t r = recv(ps.fd, &buf, 1, MSG_PEEK | MSG_DONTWAIT);
+            if (r == 0 || (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
+                close(ps.fd);
+                continue;
+            }
+            return ps.fd;
+        }
+        return -1;
+    }
+
+    // Return a socket to the pool after successful use (keep-alive)
+    void release(int fd, const std::string &host, int port) {
+        if (fd < 0) return;
+        std::string key = host + ":" + std::to_string(port);
+        auto &q = pool_[key];
+        if (static_cast<int>(q.size()) >= MAX_PER_HOST) {
+            close(q.front().fd);
+            q.pop_front();
+        }
+        q.push_back({fd, std::chrono::steady_clock::now()});
+    }
+
+    void clear() {
+        for (auto &kv : pool_)
+            for (auto &ps : kv.second)
+                close(ps.fd);
+        pool_.clear();
+    }
+
+private:
+    static constexpr int MAX_PER_HOST = 8;
+    std::unordered_map<std::string, std::deque<KislayPooledSocket>> pool_;
+};
+
+static int kislay_connect(const std::string &host, int port, std::string *error) {
+    struct addrinfo hints;
+    std::memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+
+    struct addrinfo *result = nullptr;
+    std::string port_str = std::to_string(port);
+    if (getaddrinfo(host.c_str(), port_str.c_str(), &hints, &result) != 0) {
+        if (error) *error = "getaddrinfo failed for " + host;
+        return -1;
+    }
+
+    int fd = -1;
+    for (struct addrinfo *rp = result; rp != nullptr; rp = rp->ai_next) {
+        fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+        if (fd == -1) continue;
+        // TCP_NODELAY: disable Nagle for low-latency queue operations
+        int flag = 1;
+        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
+        if (connect(fd, rp->ai_addr, rp->ai_addrlen) == 0) break;
+        close(fd);
+        fd = -1;
+    }
+    freeaddrinfo(result);
+
+    if (fd == -1 && error) *error = "connect failed to " + host + ":" + port_str;
+    return fd;
+}
+
 static bool kislay_http_request(const std::string &method, const std::string &url, const std::string &body, int *status_code, std::string *response_body, std::string *error) {
     kislay_http_url_t parsed;
     if (!kislay_parse_http_url(url, &parsed)) {
@@ -406,109 +513,102 @@ static bool kislay_http_request(const std::string &method, const std::string &ur
         return false;
     }
 
-    struct addrinfo hints;
-    std::memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-
-    struct addrinfo *result = nullptr;
-    std::string port = std::to_string(parsed.port);
-    if (getaddrinfo(parsed.host.c_str(), port.c_str(), &hints, &result) != 0) {
-        if (error != nullptr) {
-            *error = "getaddrinfo failed";
+    // Try to acquire a pooled socket first
+    bool reused = false;
+    int fd = KislayHttpPool::get().acquire(parsed.host, parsed.port);
+    if (fd < 0) {
+        std::string conn_err;
+        fd = kislay_connect(parsed.host, parsed.port, &conn_err);
+        if (fd < 0) {
+            if (error) *error = conn_err;
+            return false;
         }
-        return false;
+    } else {
+        reused = true;
     }
 
-    int fd = -1;
-    for (struct addrinfo *rp = result; rp != nullptr; rp = rp->ai_next) {
-        fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
-        if (fd == -1) {
-            continue;
+    auto do_request = [&](int sock) -> bool {
+        std::ostringstream request;
+        request << method << " " << parsed.path << " HTTP/1.1\r\n";
+        request << "Host: " << parsed.host << "\r\n";
+        request << "Connection: keep-alive\r\n";
+        if (!body.empty()) {
+            request << "Content-Type: application/json\r\n";
+            request << "Content-Length: " << body.size() << "\r\n";
         }
-        if (connect(fd, rp->ai_addr, rp->ai_addrlen) == 0) {
-            break;
+        request << "\r\n";
+        request << body;
+
+        const std::string wire = request.str();
+        std::size_t sent_bytes = 0;
+        while (sent_bytes < wire.size()) {
+            ssize_t wrote = send(sock, wire.data() + sent_bytes, wire.size() - sent_bytes, MSG_NOSIGNAL);
+            if (wrote <= 0) {
+                if (error) *error = "send failed";
+                return false;
+            }
+            sent_bytes += static_cast<std::size_t>(wrote);
         }
+
+        // Read until we have Content-Length bytes (or connection close)
+        std::string response;
+        char buffer[8192];
+        std::size_t header_end_pos = std::string::npos;
+        long long content_len = -1;
+        for (;;) {
+            ssize_t received = recv(sock, buffer, sizeof(buffer), 0);
+            if (received == 0) break;
+            if (received < 0) {
+                if (error) *error = "recv failed";
+                return false;
+            }
+            response.append(buffer, static_cast<std::size_t>(received));
+            if (header_end_pos == std::string::npos) {
+                header_end_pos = response.find("\r\n\r\n");
+                if (header_end_pos != std::string::npos) {
+                    // Parse Content-Length
+                    std::string hdrs = response.substr(0, header_end_pos);
+                    auto cl_pos = hdrs.find("Content-Length:");
+                    if (cl_pos == std::string::npos) cl_pos = hdrs.find("content-length:");
+                    if (cl_pos != std::string::npos) {
+                        content_len = std::atoll(hdrs.c_str() + cl_pos + 15);
+                    }
+                }
+            }
+            if (header_end_pos != std::string::npos && content_len >= 0) {
+                std::size_t body_start = header_end_pos + 4;
+                if (response.size() >= body_start + static_cast<std::size_t>(content_len)) break;
+            }
+        }
+
+        if (header_end_pos == std::string::npos) {
+            if (error) *error = "Invalid HTTP response";
+            return false;
+        }
+
+        std::string hdrs_part = response.substr(0, header_end_pos);
+        if (response_body) *response_body = response.substr(header_end_pos + 4);
+
+        std::size_t fs = hdrs_part.find(' ');
+        if (fs == std::string::npos) { if (error) *error = "Invalid status line"; return false; }
+        std::size_t ss = hdrs_part.find(' ', fs + 1);
+        std::string code_str = hdrs_part.substr(fs + 1, ss == std::string::npos ? std::string::npos : (ss - fs - 1));
+        if (status_code) *status_code = std::atoi(code_str.c_str());
+        return true;
+    };
+
+    bool ok = do_request(fd);
+    if (!ok && reused) {
+        // Stale pooled socket — reconnect once
         close(fd);
-        fd = -1;
+        std::string conn_err;
+        fd = kislay_connect(parsed.host, parsed.port, &conn_err);
+        if (fd < 0) { if (error) *error = conn_err; return false; }
+        ok = do_request(fd);
     }
-    freeaddrinfo(result);
-
-    if (fd == -1) {
-        if (error != nullptr) {
-            *error = "connect failed";
-        }
-        return false;
-    }
-
-    std::ostringstream request;
-    request << method << " " << parsed.path << " HTTP/1.1\r\n";
-    request << "Host: " << parsed.host << "\r\n";
-    request << "Connection: close\r\n";
-    if (!body.empty()) {
-        request << "Content-Type: application/json\r\n";
-        request << "Content-Length: " << body.size() << "\r\n";
-    }
-    request << "\r\n";
-    request << body;
-
-    const std::string wire = request.str();
-    std::size_t sent = 0;
-    while (sent < wire.size()) {
-        ssize_t wrote = send(fd, wire.data() + sent, wire.size() - sent, 0);
-        if (wrote <= 0) {
-            if (error != nullptr) {
-                *error = "send failed";
-            }
-            close(fd);
-            return false;
-        }
-        sent += static_cast<std::size_t>(wrote);
-    }
-
-    std::string response;
-    char buffer[4096];
-    for (;;) {
-        ssize_t received = recv(fd, buffer, sizeof(buffer), 0);
-        if (received == 0) {
-            break;
-        }
-        if (received < 0) {
-            if (error != nullptr) {
-                *error = "recv failed";
-            }
-            close(fd);
-            return false;
-        }
-        response.append(buffer, static_cast<std::size_t>(received));
-    }
-    close(fd);
-
-    std::size_t header_end = response.find("\r\n\r\n");
-    if (header_end == std::string::npos) {
-        if (error != nullptr) {
-            *error = "Invalid HTTP response";
-        }
-        return false;
-    }
-
-    std::string headers = response.substr(0, header_end);
-    if (response_body != nullptr) {
-        *response_body = response.substr(header_end + 4);
-    }
-
-    std::size_t first_space = headers.find(' ');
-    if (first_space == std::string::npos) {
-        if (error != nullptr) {
-            *error = "Invalid status line";
-        }
-        return false;
-    }
-    std::size_t second_space = headers.find(' ', first_space + 1);
-    std::string code = headers.substr(first_space + 1, second_space == std::string::npos ? std::string::npos : (second_space - first_space - 1));
-    if (status_code != nullptr) {
-        *status_code = std::atoi(code.c_str());
-    }
+    if (!ok) { close(fd); return false; }
+    // Return socket to pool for reuse
+    KislayHttpPool::get().release(fd, parsed.host, parsed.port);
     return true;
 }
 
@@ -1275,8 +1375,7 @@ static zend_object *kislayphp_queue_worker_create_object(zend_class_entry *ce) {
     zend_object_std_init(&obj->std, ce);
     object_properties_init(&obj->std, ce);
     new (&obj->base_url) std::string("http://127.0.0.1:9020");
-    obj->base_url = "http://127.0.0.1:9020";
-    obj->stop_requested = false;
+    new (&obj->stop_requested) std::atomic<bool>(false);
     obj->std.handlers = &kislayphp_queue_worker_handlers;
     return &obj->std;
 }
@@ -1284,6 +1383,7 @@ static zend_object *kislayphp_queue_worker_create_object(zend_class_entry *ce) {
 static void kislayphp_queue_worker_free_obj(zend_object *object) {
     php_kislayphp_queue_worker_t *obj = php_kislayphp_queue_worker_from_obj(object);
     obj->base_url.~basic_string();
+    obj->stop_requested.~atomic();
     zend_object_std_dtor(&obj->std);
 }
 
@@ -1682,9 +1782,7 @@ PHP_METHOD(KislayPHPQueueServer, run) {
     while (obj->running) {
         int client_fd = accept(server_fd, nullptr, nullptr);
         if (client_fd < 0) {
-            if (!obj->running) {
-                break;
-            }
+            if (!obj->running) break;
             continue;
         }
 
@@ -1870,6 +1968,69 @@ PHP_METHOD(KislayPHPQueueServer, run) {
             continue;
         }
 
+        // Batch push: POST /v1/queues/{queue}/jobs/batch
+        // Body: {"jobs":[{"payload":...,"delay_ms":0}, ...]}
+        std::string batch_queue;
+        if (request.method == "POST" &&
+            kislay_queue_path_extract(request.path, "/v1/queues/", "/jobs/batch", &batch_queue)) {
+            zval decoded;
+            ZVAL_UNDEF(&decoded);
+            if (!kislay_json_decode_assoc(request.body, &decoded) || Z_TYPE(decoded) != IS_ARRAY) {
+                kislay_http_send_response(client_fd, 400, "application/json", "{\"error\":\"invalid json\"}");
+                close(client_fd);
+                continue;
+            }
+            zval *jobs_arr = zend_hash_str_find(Z_ARRVAL(decoded), "jobs", sizeof("jobs")-1);
+            if (!jobs_arr || Z_TYPE_P(jobs_arr) != IS_ARRAY) {
+                zval_ptr_dtor(&decoded);
+                kislay_http_send_response(client_fd, 400, "application/json", "{\"error\":\"missing jobs array\"}");
+                close(client_fd);
+                continue;
+            }
+            std::vector<std::string> ids;
+            zval *job_item;
+            ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(jobs_arr), job_item) {
+                if (Z_TYPE_P(job_item) != IS_ARRAY) continue;
+                zval *payload_zv = zend_hash_str_find(Z_ARRVAL_P(job_item), "payload", sizeof("payload")-1);
+                zend_long delay_ms = 0;
+                zval *delay_zv = zend_hash_str_find(Z_ARRVAL_P(job_item), "delay_ms", sizeof("delay_ms")-1);
+                if (delay_zv && Z_TYPE_P(delay_zv) == IS_LONG) delay_ms = Z_LVAL_P(delay_zv);
+                std::string payload_bytes;
+                if (payload_zv) {
+                    kislay_json_encode_zval(payload_zv, &payload_bytes);
+                } else {
+                    payload_bytes = "{}";
+                }
+                kislay_scoped_lock_t guard(&obj->lock);
+                std::string job_id = "job-" + std::to_string(obj->next_job_id++);
+                kislay_queue_job_record_t rec;
+                rec.id = job_id;
+                rec.queue = batch_queue;
+                rec.payload_bytes = payload_bytes;
+                rec.status = "ready";
+                std::uint64_t now_ms = kislay_now_ms();
+                rec.created_at_ms = now_ms;
+                rec.available_at_ms = now_ms + static_cast<std::uint64_t>(delay_ms > 0 ? delay_ms : 0);
+                auto &config = obj->configs[batch_queue];
+                rec.max_attempts = config.max_attempts;
+                obj->jobs[job_id] = std::move(rec);
+                obj->queue_jobs[batch_queue].push_back(job_id);
+                obj->stats[batch_queue].pushed_total++;
+                ids.push_back(job_id);
+            } ZEND_HASH_FOREACH_END();
+            zval_ptr_dtor(&decoded);
+            std::ostringstream resp;
+            resp << "{\"count\":"  << ids.size() << ",\"ids\":[";
+            for (std::size_t i = 0; i < ids.size(); ++i) {
+                if (i > 0) resp << ",";
+                resp << "\"" << ids[i] << "\"";
+            }
+            resp << "]}";
+            kislay_http_send_response(client_fd, 201, "application/json", resp.str());
+            close(client_fd);
+            continue;
+        }
+
         kislay_http_send_response(client_fd, 404, "application/json", "{\"error\":\"not found\"}");
         close(client_fd);
     }
@@ -2020,7 +2181,7 @@ PHP_METHOD(KislayPHPQueueWorker, __construct) {
 
     php_kislayphp_queue_worker_t *obj = php_kislayphp_queue_worker_from_obj(Z_OBJ_P(getThis()));
     obj->base_url.assign(base_url, base_url_len);
-    obj->stop_requested = false;
+    obj->stop_requested.store(false, std::memory_order_relaxed);
     (void) options;
 }
 
@@ -2042,7 +2203,7 @@ PHP_METHOD(KislayPHPQueueWorker, consume) {
     }
 
     php_kislayphp_queue_worker_t *obj = php_kislayphp_queue_worker_from_obj(Z_OBJ_P(getThis()));
-    obj->stop_requested = false;
+    obj->stop_requested.store(false, std::memory_order_relaxed);
 
     zend_long poll_interval_ms = 250;
     zend_long lease_ms = 30000;
