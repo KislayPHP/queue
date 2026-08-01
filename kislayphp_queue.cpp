@@ -362,23 +362,6 @@ static std::vector<std::string> kislay_split(const std::string &value, char deli
     return parts;
 }
 
-static std::map<std::string, std::string> kislay_parse_query(const std::string &query) {
-    std::map<std::string, std::string> out;
-    std::vector<std::string> pairs = kislay_split(query, '&');
-    for (std::size_t i = 0; i < pairs.size(); ++i) {
-        if (pairs[i].empty()) {
-            continue;
-        }
-        std::size_t eq = pairs[i].find('=');
-        if (eq == std::string::npos) {
-            out[kislay_url_decode(pairs[i])] = "";
-        } else {
-            out[kislay_url_decode(pairs[i].substr(0, eq))] = kislay_url_decode(pairs[i].substr(eq + 1));
-        }
-    }
-    return out;
-}
-
 static bool kislay_parse_http_url(const std::string &url, kislay_http_url_t *parsed) {
     std::string work = url;
     const std::string http_prefix("http://");
