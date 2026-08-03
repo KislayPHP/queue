@@ -233,6 +233,24 @@ struct kislay_scoped_lock_t {
     }
 };
 
+// Server::run()'s accept loop spawns a brand-new std::thread per client
+// connection (see the handler below), and every non-trivial request branch
+// touches the Zend engine directly - kislay_json_decode_assoc() calls into
+// call_user_function()/json_decode(), and array_init()/add_assoc_*()/
+// zval_ptr_dtor() all touch zend_mm. On an NTS build there is no per-thread
+// engine isolation, so two client threads doing this concurrently (trivially
+// reachable: any two overlapping requests, e.g. a producer push racing a
+// worker's fetch) race on the same executor/allocator state with no
+// happens-before edge - the same zend_mm heap corruption class found and
+// fixed in kislayphp/socket's civetweb callback path this session. This
+// mutex serializes every Zend touch across all connection threads, mirroring
+// that fix (kislay_socket_php_call_lock in socket/kislay_socket.cpp).
+// Recursive because some locked helpers (e.g. request handling that also
+// takes obj->lock for the queue data structures) call back into Zend-facing
+// code under it; lock ordering here is fixed as php_call_lock outermost,
+// obj->lock nested inside, never the reverse.
+static std::recursive_mutex kislay_queue_php_call_lock;
+
 static inline php_kislayphp_queue_t *php_kislayphp_queue_from_obj(zend_object *obj) {
     return reinterpret_cast<php_kislayphp_queue_t *>(reinterpret_cast<char *>(obj) - XtOffsetOf(php_kislayphp_queue_t, std));
 }
@@ -1769,18 +1787,28 @@ PHP_METHOD(KislayPHPQueueServer, run) {
             continue;
         }
 
+        // Dispatch each client connection to its own thread so a slow client never
+        // blocks the accept loop (or any other active client).
+        std::thread([obj, client_fd]() {
         kislay_http_request_t request;
         if (!kislay_http_read_request(client_fd, &request)) {
             kislay_http_send_response(client_fd, 400, "application/json", "{\"error\":\"invalid request\"}");
             close(client_fd);
-            continue;
+            return;
         }
 
         if (request.path == "/health") {
             kislay_http_send_response(client_fd, 200, "text/plain", "OK");
             close(client_fd);
-            continue;
+            return;
         }
+
+        // Every branch below this point may touch the Zend engine (JSON
+        // decode/encode, zval construction) - see kislay_queue_php_call_lock's
+        // definition for why this must be held across all of it, including
+        // the response send (a fast local write, unlike socket's long-poll
+        // wait, so holding the lock through it is an accepted, bounded cost).
+        std::lock_guard<std::recursive_mutex> php_guard(kislay_queue_php_call_lock);
 
         std::string queue_name;
         std::string job_id;
@@ -1794,7 +1822,7 @@ PHP_METHOD(KislayPHPQueueServer, run) {
                 }
                 kislay_http_send_response(client_fd, 400, "application/json", "{\"error\":\"invalid json\"}");
                 close(client_fd);
-                continue;
+                return;
             }
             std::string payload_hex;
             std::string headers_hex;
@@ -1808,7 +1836,7 @@ PHP_METHOD(KislayPHPQueueServer, run) {
                 zval_ptr_dtor(&decoded);
                 kislay_http_send_response(client_fd, 400, "application/json", "{\"error\":\"invalid payload encoding\"}");
                 close(client_fd);
-                continue;
+                return;
             }
             std::string created_id;
             {
@@ -1819,7 +1847,7 @@ PHP_METHOD(KislayPHPQueueServer, run) {
             std::string body = std::string("{\"job_id\":\"") + created_id + "\"}";
             kislay_http_send_response(client_fd, 201, "application/json", body);
             close(client_fd);
-            continue;
+            return;
         }
 
         if (request.method == "POST" && kislay_queue_path_extract(request.path, "/v1/queues/", "/fetch", &queue_name)) {
@@ -1831,7 +1859,7 @@ PHP_METHOD(KislayPHPQueueServer, run) {
                 }
                 kislay_http_send_response(client_fd, 400, "application/json", "{\"error\":\"invalid json\"}");
                 close(client_fd);
-                continue;
+                return;
             }
             std::string worker_id = "worker";
             kislay_hash_find_string(Z_ARRVAL(decoded), "worker_id", &worker_id);
@@ -1846,7 +1874,7 @@ PHP_METHOD(KislayPHPQueueServer, run) {
             if (!fetched.found) {
                 kislay_http_send_response(client_fd, 200, "application/json", "{\"job\":null}");
                 close(client_fd);
-                continue;
+                return;
             }
 
             zval root;
@@ -1866,12 +1894,12 @@ PHP_METHOD(KislayPHPQueueServer, run) {
                 zval_ptr_dtor(&root);
                 kislay_http_send_response(client_fd, 500, "application/json", "{\"error\":\"encode failed\"}");
                 close(client_fd);
-                continue;
+                return;
             }
             zval_ptr_dtor(&root);
             kislay_http_send_response(client_fd, 200, "application/json", json);
             close(client_fd);
-            continue;
+            return;
         }
 
         if (request.method == "GET" && kislay_queue_path_extract(request.path, "/v1/queues/", "/stats", &queue_name)) {
@@ -1886,12 +1914,12 @@ PHP_METHOD(KislayPHPQueueServer, run) {
                 zval_ptr_dtor(&root);
                 kislay_http_send_response(client_fd, 500, "application/json", "{\"error\":\"encode failed\"}");
                 close(client_fd);
-                continue;
+                return;
             }
             zval_ptr_dtor(&root);
             kislay_http_send_response(client_fd, 200, "application/json", json);
             close(client_fd);
-            continue;
+            return;
         }
 
         if (request.method == "POST" && kislay_queue_path_extract(request.path, "/v1/queues/", "/purge", &queue_name)) {
@@ -1904,7 +1932,7 @@ PHP_METHOD(KislayPHPQueueServer, run) {
             payload << "{\"removed\":" << removed << "}";
             kislay_http_send_response(client_fd, 200, "application/json", payload.str());
             close(client_fd);
-            continue;
+            return;
         }
 
         if (request.method == "POST" && kislay_queue_path_extract(request.path, "/v1/jobs/", "/ack", &job_id)) {
@@ -1915,7 +1943,7 @@ PHP_METHOD(KislayPHPQueueServer, run) {
             }
             kislay_http_send_response(client_fd, ok ? 200 : 404, "application/json", ok ? "{\"ok\":true}" : "{\"error\":\"job not found\"}");
             close(client_fd);
-            continue;
+            return;
         }
 
         if (request.method == "POST" && kislay_queue_path_extract(request.path, "/v1/jobs/", "/nack", &job_id)) {
@@ -1927,7 +1955,7 @@ PHP_METHOD(KislayPHPQueueServer, run) {
                 }
                 kislay_http_send_response(client_fd, 400, "application/json", "{\"error\":\"invalid json\"}");
                 close(client_fd);
-                continue;
+                return;
             }
             bool requeue = true;
             zend_long delay_ms = -1;
@@ -1948,7 +1976,7 @@ PHP_METHOD(KislayPHPQueueServer, run) {
             }
             kislay_http_send_response(client_fd, ok ? 200 : 404, "application/json", ok ? "{\"ok\":true}" : "{\"error\":\"job not found\"}");
             close(client_fd);
-            continue;
+            return;
         }
 
         // Batch push: POST /v1/queues/{queue}/jobs/batch
@@ -1961,14 +1989,14 @@ PHP_METHOD(KislayPHPQueueServer, run) {
             if (!kislay_json_decode_assoc(request.body, &decoded) || Z_TYPE(decoded) != IS_ARRAY) {
                 kislay_http_send_response(client_fd, 400, "application/json", "{\"error\":\"invalid json\"}");
                 close(client_fd);
-                continue;
+                return;
             }
             zval *jobs_arr = zend_hash_str_find(Z_ARRVAL(decoded), "jobs", sizeof("jobs")-1);
             if (!jobs_arr || Z_TYPE_P(jobs_arr) != IS_ARRAY) {
                 zval_ptr_dtor(&decoded);
                 kislay_http_send_response(client_fd, 400, "application/json", "{\"error\":\"missing jobs array\"}");
                 close(client_fd);
-                continue;
+                return;
             }
             std::vector<std::string> ids;
             zval *job_item;
@@ -2011,11 +2039,12 @@ PHP_METHOD(KislayPHPQueueServer, run) {
             resp << "]}";
             kislay_http_send_response(client_fd, 201, "application/json", resp.str());
             close(client_fd);
-            continue;
+            return;
         }
 
         kislay_http_send_response(client_fd, 404, "application/json", "{\"error\":\"not found\"}");
         close(client_fd);
+        }).detach();
     }
 
     if (obj->listen_fd >= 0) {
