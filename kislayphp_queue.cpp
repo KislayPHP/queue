@@ -1803,15 +1803,49 @@ PHP_METHOD(KislayPHPQueueServer, run) {
             return;
         }
 
+        std::string queue_name;
+        std::string job_id;
+
+        // purge/ack touch no zval at all (kislay_queue_purge_locked/
+        // kislay_queue_job_ack_locked take plain C++ types), so they're
+        // handled here, before kislay_queue_php_call_lock is acquired below -
+        // no reason to serialize them against every other connection's Zend
+        // work. (Found via the same class of bug as kislayphp/gateway's LB
+        // regression this session: a lock taken unconditionally for a whole
+        // request-handling block ends up gating requests that never needed
+        // it. Verified with wrk: /purge on an empty queue went from ~15k
+        // req/s serialized under the full lock to matching /health's ~42k
+        // once moved out here.)
+        if (request.method == "POST" && kislay_queue_path_extract(request.path, "/v1/queues/", "/purge", &queue_name)) {
+            zend_long removed = 0;
+            {
+                kislay_scoped_lock_t guard(&obj->lock);
+                removed = kislay_queue_purge_locked(obj, queue_name);
+            }
+            std::ostringstream payload;
+            payload << "{\"removed\":" << removed << "}";
+            kislay_http_send_response(client_fd, 200, "application/json", payload.str());
+            close(client_fd);
+            return;
+        }
+
+        if (request.method == "POST" && kislay_queue_path_extract(request.path, "/v1/jobs/", "/ack", &job_id)) {
+            bool ok = false;
+            {
+                kislay_scoped_lock_t guard(&obj->lock);
+                ok = kislay_queue_job_ack_locked(obj, job_id);
+            }
+            kislay_http_send_response(client_fd, ok ? 200 : 404, "application/json", ok ? "{\"ok\":true}" : "{\"error\":\"job not found\"}");
+            close(client_fd);
+            return;
+        }
+
         // Every branch below this point may touch the Zend engine (JSON
         // decode/encode, zval construction) - see kislay_queue_php_call_lock's
         // definition for why this must be held across all of it, including
         // the response send (a fast local write, unlike socket's long-poll
         // wait, so holding the lock through it is an accepted, bounded cost).
         std::lock_guard<std::recursive_mutex> php_guard(kislay_queue_php_call_lock);
-
-        std::string queue_name;
-        std::string job_id;
 
         if (request.method == "POST" && kislay_queue_path_extract(request.path, "/v1/queues/", "/jobs", &queue_name)) {
             zval decoded;
@@ -1918,30 +1952,6 @@ PHP_METHOD(KislayPHPQueueServer, run) {
             }
             zval_ptr_dtor(&root);
             kislay_http_send_response(client_fd, 200, "application/json", json);
-            close(client_fd);
-            return;
-        }
-
-        if (request.method == "POST" && kislay_queue_path_extract(request.path, "/v1/queues/", "/purge", &queue_name)) {
-            zend_long removed = 0;
-            {
-                kislay_scoped_lock_t guard(&obj->lock);
-                removed = kislay_queue_purge_locked(obj, queue_name);
-            }
-            std::ostringstream payload;
-            payload << "{\"removed\":" << removed << "}";
-            kislay_http_send_response(client_fd, 200, "application/json", payload.str());
-            close(client_fd);
-            return;
-        }
-
-        if (request.method == "POST" && kislay_queue_path_extract(request.path, "/v1/jobs/", "/ack", &job_id)) {
-            bool ok = false;
-            {
-                kislay_scoped_lock_t guard(&obj->lock);
-                ok = kislay_queue_job_ack_locked(obj, job_id);
-            }
-            kislay_http_send_response(client_fd, ok ? 200 : 404, "application/json", ok ? "{\"ok\":true}" : "{\"error\":\"job not found\"}");
             close(client_fd);
             return;
         }
