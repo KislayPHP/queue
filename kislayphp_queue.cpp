@@ -33,6 +33,8 @@ extern "C" {
 #include <mutex>
 #include <thread>
 #include <deque>
+#include <random>
+#include <sys/time.h>
 
 #include "Zend/zend_smart_str.h"
 #include "ext/standard/php_var.h"
@@ -122,6 +124,14 @@ struct kislay_queue_config_t {
 
 struct kislay_queue_stats_t {
     std::uint64_t pushed_total;
+    // Incremented once per push HTTP request handled (both the single-job
+    // POST .../jobs endpoint and the POST .../jobs/batch endpoint), whereas
+    // pushed_total is incremented once per job. For a batch push of N jobs
+    // in one call, pushed_total goes up by N but push_requests_total goes up
+    // by exactly 1 - this is what the batch endpoint exists to guarantee,
+    // and what tests/push_consume_ack_nack_dlq_test.phpt asserts on to catch
+    // any regression back to the old "pushBatch loops over single push" bug.
+    std::uint64_t push_requests_total;
     std::uint64_t fetched_total;
     std::uint64_t acked_total;
     std::uint64_t nacked_total;
@@ -131,6 +141,7 @@ struct kislay_queue_stats_t {
 
     kislay_queue_stats_t()
         : pushed_total(0),
+          push_requests_total(0),
           fetched_total(0),
           acked_total(0),
           nacked_total(0),
@@ -183,13 +194,29 @@ typedef struct _php_kislayphp_queue_t {
     zend_object std;
 } php_kislayphp_queue_t;
 
+// Bounded record of a recently-completed push (single or batch), keyed by a
+// client-generated idempotency key. See "Idempotent push" comment near
+// kislay_queue_idempotency_lookup_locked() for the full design.
+struct kislay_idempotency_entry_t {
+    std::string response_body;
+    int status_code;
+    std::uint64_t created_at_ms;
+};
+
 typedef struct _php_kislayphp_queue_server_t {
     std::unordered_map<std::string, kislay_queue_config_t> configs;
     std::unordered_map<std::string, std::vector<std::string>> queue_jobs;
     std::unordered_map<std::string, kislay_queue_job_record_t> jobs;
     std::unordered_map<std::string, kislay_queue_stats_t> stats;
+    // Idempotency cache for push requests: idempotency_key -> the response
+    // that was actually sent the first time that key was seen. idempotency_order
+    // is a FIFO of keys used to bound the cache (both by count and, lazily, by
+    // age) without needing a background sweep thread.
+    std::unordered_map<std::string, kislay_idempotency_entry_t> idempotency_cache;
+    std::deque<std::string> idempotency_order;
     std::string host;
     zend_long port;
+    zend_long socket_timeout_ms;
     int listen_fd;
     bool running;
     std::uint64_t next_job_id;
@@ -250,6 +277,24 @@ struct kislay_scoped_lock_t {
 // code under it; lock ordering here is fixed as php_call_lock outermost,
 // obj->lock nested inside, never the reverse.
 static std::recursive_mutex kislay_queue_php_call_lock;
+
+// Server::run() spawns one detached thread per accepted connection with no
+// cap and (until this fix) no read/write deadline, so a client that connects
+// and then sends nothing - or trickles bytes - parks a thread+fd forever.
+// Enough such connections exhaust the fd table / thread resources: a classic
+// slow-loris DoS. KISLAY_QUEUE_MAX_CONNECTIONS bounds how many connections
+// can be mid-handling at once (further accepts are rejected immediately with
+// a 503-equivalent rather than queued indefinitely); the per-socket
+// SO_RCVTIMEO/SO_SNDTIMEO set right after accept() (see run()) bounds how
+// long any single one of those threads can be stuck on a slow/silent peer.
+static std::atomic<int> kislay_queue_active_connections{0};
+static constexpr int KISLAY_QUEUE_MAX_CONNECTIONS = 512;
+
+struct kislay_queue_connection_guard_t {
+    ~kislay_queue_connection_guard_t() {
+        kislay_queue_active_connections.fetch_sub(1, std::memory_order_relaxed);
+    }
+};
 
 static inline php_kislayphp_queue_t *php_kislayphp_queue_from_obj(zend_object *obj) {
     return reinterpret_cast<php_kislayphp_queue_t *>(reinterpret_cast<char *>(obj) - XtOffsetOf(php_kislayphp_queue_t, std));
@@ -528,7 +573,15 @@ static bool kislay_http_request(const std::string &method, const std::string &ur
         reused = true;
     }
 
+    // Set by do_request() the moment any byte of the request has actually been
+    // handed to the kernel for this attempt. Used below to decide whether a
+    // failed attempt is safe to blindly retry: see the comment at the retry
+    // site for why this matters (non-idempotent operations like job push can
+    // otherwise be double-executed).
+    bool any_bytes_sent = false;
+
     auto do_request = [&](int sock) -> bool {
+        any_bytes_sent = false;
         std::ostringstream request;
         request << method << " " << parsed.path << " HTTP/1.1\r\n";
         request << "Host: " << parsed.host << "\r\n";
@@ -549,6 +602,7 @@ static bool kislay_http_request(const std::string &method, const std::string &ur
                 return false;
             }
             sent_bytes += static_cast<std::size_t>(wrote);
+            any_bytes_sent = true;
         }
 
         // Read until we have Content-Length bytes (or connection close)
@@ -599,7 +653,26 @@ static bool kislay_http_request(const std::string &method, const std::string &ur
     };
 
     bool ok = do_request(fd);
-    if (!ok && reused) {
+    // Only auto-retry a pooled connection's failure when we can be reasonably
+    // sure the server never saw any part of this request - i.e. the failure
+    // happened in send() before a single byte went out (the classic "pool
+    // handed us a socket the peer had already closed" case). If any bytes
+    // were written and *then* something failed (most commonly: recv() fails
+    // after a full send(), e.g. the connection was reset mid-response), the
+    // request may well have reached and been processed by the server, so
+    // blindly resending here could double-execute a non-idempotent operation
+    // (e.g. double-push a job). In that case we surface the failure to the
+    // caller instead of retrying.
+    //
+    // This is defense-in-depth underneath the idempotency-key mechanism the
+    // queue push paths use (see kislay_queue_client_push_remote() and the
+    // server-side "Idempotent push" comment above
+    // kislay_queue_idempotency_lookup_locked()): even if a caller above this
+    // layer does retry after a false return here, a repeated idempotency key
+    // lets the server recognize and no-op the duplicate. Callers that don't
+    // send an idempotency key (any direct kislay_http_request() use outside
+    // the push paths) only get the weaker guarantee this retry gate provides.
+    if (!ok && reused && !any_bytes_sent) {
         // Stale pooled socket — reconnect once
         close(fd);
         std::string conn_err;
@@ -916,6 +989,76 @@ static void kislay_queue_reconcile_job_locked(php_kislayphp_queue_server_t *serv
     }
 }
 
+// Idempotent push
+// ----------------
+// KislayHttpPool (see kislay_http_request()) will, on a pooled/reused
+// connection, reconnect and resend a request if reading the response fails
+// after the request was already written - it cannot tell "server never saw
+// it" apart from "server saw it, processed it, and the response just got
+// lost". For push endpoints that means a bare retry can silently create two
+// jobs for what the caller believes is one push.
+//
+// The client (kislay_queue_client_push_remote() and
+// kislay_queue_client_push_batch_remote()) generates a fresh idempotency key
+// per logical push call and sends it with the request body. Because the
+// retry in kislay_http_request() resends the exact same body bytes, both the
+// original attempt and the reconnect-retry attempt carry the *same* key.
+// Here on the server we remember the response we sent for each key we've
+// seen recently and, on a repeat, return that exact response again instead
+// of creating a second job. The cache is bounded both in size and in age so
+// it can't grow without bound.
+static constexpr std::size_t KISLAY_IDEMPOTENCY_MAX_ENTRIES = 4096;
+static constexpr std::uint64_t KISLAY_IDEMPOTENCY_TTL_MS = 5ULL * 60ULL * 1000ULL; // 5 minutes
+
+static bool kislay_queue_idempotency_lookup_locked(php_kislayphp_queue_server_t *server, const std::string &key, std::string *response_body, int *status_code) {
+    if (key.empty()) {
+        return false;
+    }
+    std::unordered_map<std::string, kislay_idempotency_entry_t>::iterator it = server->idempotency_cache.find(key);
+    if (it == server->idempotency_cache.end()) {
+        return false;
+    }
+    if (kislay_now_ms() - it->second.created_at_ms > KISLAY_IDEMPOTENCY_TTL_MS) {
+        // Expired: treat as a miss. It'll be swept out of idempotency_order
+        // (and idempotency_cache) lazily the next time an entry is stored -
+        // no separate background sweeper is needed for a cache this small.
+        return false;
+    }
+    *response_body = it->second.response_body;
+    *status_code = it->second.status_code;
+    return true;
+}
+
+static void kislay_queue_idempotency_store_locked(php_kislayphp_queue_server_t *server, const std::string &key, int status_code, const std::string &response_body) {
+    if (key.empty()) {
+        return;
+    }
+    std::uint64_t now_ms = kislay_now_ms();
+    // Evict from the front (oldest-inserted first) while an entry there is
+    // expired, or while we're at capacity and need room for the new one.
+    while (!server->idempotency_order.empty()) {
+        const std::string &oldest_key = server->idempotency_order.front();
+        std::unordered_map<std::string, kislay_idempotency_entry_t>::iterator it = server->idempotency_cache.find(oldest_key);
+        bool expired = (it == server->idempotency_cache.end()) || (now_ms - it->second.created_at_ms > KISLAY_IDEMPOTENCY_TTL_MS);
+        bool over_capacity = server->idempotency_cache.size() >= KISLAY_IDEMPOTENCY_MAX_ENTRIES;
+        if (!expired && !over_capacity) {
+            break;
+        }
+        if (it != server->idempotency_cache.end()) {
+            server->idempotency_cache.erase(it);
+        }
+        server->idempotency_order.pop_front();
+    }
+    if (server->idempotency_cache.find(key) == server->idempotency_cache.end()) {
+        server->idempotency_order.push_back(key);
+    }
+    kislay_idempotency_entry_t entry;
+    entry.response_body = response_body;
+    entry.status_code = status_code;
+    entry.created_at_ms = now_ms;
+    server->idempotency_cache[key] = entry;
+}
+
 static std::string kislay_queue_push_locked(php_kislayphp_queue_server_t *server, const std::string &queue, const std::string &payload_bytes, const std::string &headers_bytes, zend_long delay_ms, zend_long max_attempts) {
     kislay_queue_config_t &config = kislay_queue_ensure_config_locked(server, queue);
     kislay_queue_stats_t &stats = kislay_queue_ensure_stats_locked(server, queue);
@@ -1030,6 +1173,7 @@ static void kislay_queue_stats_to_zval(php_kislayphp_queue_server_t *server, con
     add_assoc_long(return_value, "delayed", static_cast<zend_long>(delayed));
     add_assoc_long(return_value, "leased", static_cast<zend_long>(leased));
     add_assoc_long(return_value, "pushed_total", static_cast<zend_long>(stats.pushed_total));
+    add_assoc_long(return_value, "push_requests_total", static_cast<zend_long>(stats.push_requests_total));
     add_assoc_long(return_value, "fetched_total", static_cast<zend_long>(stats.fetched_total));
     add_assoc_long(return_value, "acked_total", static_cast<zend_long>(stats.acked_total));
     add_assoc_long(return_value, "nacked_total", static_cast<zend_long>(stats.nacked_total));
@@ -1102,6 +1246,37 @@ static bool kislay_queue_client_request_json(const std::string &method, const st
     return true;
 }
 
+// Generates a client-side idempotency key: unique enough (128 bits of
+// std::random_device-seeded entropy, formatted as a UUID) to treat two
+// requests carrying the same key as "the same logical push" server-side. See
+// the "Idempotent push" comment above kislay_queue_idempotency_lookup_locked()
+// for how the client and server use this together.
+static std::string kislay_generate_idempotency_key() {
+    static std::mt19937_64 engine([]() {
+        std::random_device rd;
+        std::uint64_t seed = (static_cast<std::uint64_t>(rd()) << 32) ^ rd();
+        seed ^= static_cast<std::uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count());
+        return seed;
+    }());
+    static std::mutex engine_mutex;
+    std::uint64_t hi;
+    std::uint64_t lo;
+    {
+        std::lock_guard<std::mutex> lock(engine_mutex);
+        std::uniform_int_distribution<std::uint64_t> dist;
+        hi = dist(engine);
+        lo = dist(engine);
+    }
+    char buf[37];
+    std::snprintf(buf, sizeof(buf), "%08x-%04x-%04x-%04x-%012llx",
+        static_cast<unsigned>(hi >> 32),
+        static_cast<unsigned>((hi >> 16) & 0xFFFFu),
+        static_cast<unsigned>((hi & 0x0FFFu) | 0x4000u),          // version 4
+        static_cast<unsigned>(((lo >> 48) & 0x3FFFu) | 0x8000u),  // variant 1
+        static_cast<unsigned long long>(lo & 0xFFFFFFFFFFFFULL));
+    return std::string(buf);
+}
+
 static bool kislay_queue_client_push_remote(const std::string &base_url, const std::string &queue, zval *payload, zval *options, std::string *job_id, std::string *error) {
     std::string payload_bytes;
     if (!kislay_serialize_payload(payload, &payload_bytes)) {
@@ -1114,10 +1289,16 @@ static bool kislay_queue_client_push_remote(const std::string &base_url, const s
     std::string headers_bytes;
     zend_long delay_ms = 0;
     zend_long max_attempts = 0;
+    std::string idem_key;
     if (options != nullptr && Z_TYPE_P(options) == IS_ARRAY) {
         HashTable *ht = Z_ARRVAL_P(options);
         delay_ms = kislay_hash_find_long(ht, "delay_ms", 0);
         max_attempts = kislay_hash_find_long(ht, "max_attempts", 0);
+        // Callers that implement their own userland-level retry can pass an
+        // explicit idempotency_key so their retry dedups server-side too;
+        // otherwise we mint a fresh one below, which at minimum covers the
+        // automatic reconnect-retry inside kislay_http_request().
+        kislay_hash_find_string(ht, "idempotency_key", &idem_key);
         zval *headers = kislay_hash_find(ht, "headers");
         if (headers != nullptr && Z_TYPE_P(headers) != IS_NULL) {
             if (!kislay_serialize_payload(headers, &headers_bytes)) {
@@ -1128,6 +1309,9 @@ static bool kislay_queue_client_push_remote(const std::string &base_url, const s
             }
         }
     }
+    if (idem_key.empty()) {
+        idem_key = kislay_generate_idempotency_key();
+    }
 
     zval root;
     array_init(&root);
@@ -1137,6 +1321,7 @@ static bool kislay_queue_client_push_remote(const std::string &base_url, const s
     if (max_attempts > 0) {
         add_assoc_long(&root, "max_attempts", max_attempts);
     }
+    add_assoc_string(&root, "idempotency_key", const_cast<char *>(idem_key.c_str()));
 
     std::string json;
     bool ok = kislay_queue_build_json_body(&root, &json, error);
@@ -1330,9 +1515,17 @@ static zend_object *kislayphp_queue_server_create_object(zend_class_entry *ce) {
     new (&obj->queue_jobs) std::unordered_map<std::string, std::vector<std::string>>();
     new (&obj->jobs) std::unordered_map<std::string, kislay_queue_job_record_t>();
     new (&obj->stats) std::unordered_map<std::string, kislay_queue_stats_t>();
+    new (&obj->idempotency_cache) std::unordered_map<std::string, kislay_idempotency_entry_t>();
+    new (&obj->idempotency_order) std::deque<std::string>();
     new (&obj->host) std::string("127.0.0.1");
     obj->host = "127.0.0.1";
     obj->port = 9020;
+    // Read/write deadline applied to every accepted connection (see run()) -
+    // bounds how long a slow/stalled client can pin a thread+fd. Overridable
+    // via the constructor's $options['socket_timeout_ms'] (tests use a short
+    // value so the slow-loris test doesn't need to wait out the production
+    // default).
+    obj->socket_timeout_ms = 15000;
     obj->listen_fd = -1;
     obj->running = false;
     obj->next_job_id = 0;
@@ -1351,6 +1544,8 @@ static void kislayphp_queue_server_free_obj(zend_object *object) {
     obj->queue_jobs.~unordered_map();
     obj->jobs.~unordered_map();
     obj->stats.~unordered_map();
+    obj->idempotency_cache.~unordered_map();
+    obj->idempotency_order.~deque();
     pthread_mutex_destroy(&obj->lock);
     zend_object_std_dtor(&obj->std);
 }
@@ -1673,6 +1868,7 @@ PHP_METHOD(KislayPHPQueueServer, __construct) {
             obj->host = host;
         }
         obj->port = kislay_hash_find_long(ht, "port", obj->port);
+        obj->socket_timeout_ms = kislay_hash_find_long(ht, "socket_timeout_ms", obj->socket_timeout_ms);
     }
 }
 
@@ -1787,9 +1983,34 @@ PHP_METHOD(KislayPHPQueueServer, run) {
             continue;
         }
 
+        // Reject immediately rather than spawning an unbounded number of
+        // detached threads once too many connections are already being
+        // handled - see kislay_queue_active_connections' comment.
+        if (kislay_queue_active_connections.load(std::memory_order_relaxed) >= KISLAY_QUEUE_MAX_CONNECTIONS) {
+            kislay_http_send_response(client_fd, 503, "application/json", "{\"error\":\"server busy\"}");
+            close(client_fd);
+            continue;
+        }
+
+        // Read/write deadline for this connection: without this a client that
+        // connects and sends nothing (or trickles bytes) parks this thread+fd
+        // forever. recv()/send() now fail with EAGAIN/EWOULDBLOCK past the
+        // deadline, which kislay_http_read_request() (and do_request() in
+        // kislay_http_request) already treat as a hard failure.
+        struct timeval io_timeout;
+        io_timeout.tv_sec = static_cast<time_t>(obj->socket_timeout_ms / 1000);
+        io_timeout.tv_usec = static_cast<suseconds_t>((obj->socket_timeout_ms % 1000) * 1000);
+        setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &io_timeout, sizeof(io_timeout));
+        setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &io_timeout, sizeof(io_timeout));
+
+        kislay_queue_active_connections.fetch_add(1, std::memory_order_relaxed);
+
         // Dispatch each client connection to its own thread so a slow client never
         // blocks the accept loop (or any other active client).
         std::thread([obj, client_fd]() {
+        // Decrements kislay_queue_active_connections on every exit path below
+        // (there are many early returns), so the cap check above stays accurate.
+        kislay_queue_connection_guard_t conn_guard;
         kislay_http_request_t request;
         if (!kislay_http_read_request(client_fd, &request)) {
             kislay_http_send_response(client_fd, 400, "application/json", "{\"error\":\"invalid request\"}");
@@ -1862,6 +2083,8 @@ PHP_METHOD(KislayPHPQueueServer, run) {
             std::string headers_hex;
             kislay_hash_find_string(Z_ARRVAL(decoded), "payload_hex", &payload_hex);
             kislay_hash_find_string(Z_ARRVAL(decoded), "headers_hex", &headers_hex);
+            std::string idem_key;
+            kislay_hash_find_string(Z_ARRVAL(decoded), "idempotency_key", &idem_key);
             std::string payload_bytes;
             std::string headers_bytes;
             zend_long delay_ms = kislay_hash_find_long(Z_ARRVAL(decoded), "delay_ms", 0);
@@ -1872,14 +2095,29 @@ PHP_METHOD(KislayPHPQueueServer, run) {
                 close(client_fd);
                 return;
             }
-            std::string created_id;
+            zval_ptr_dtor(&decoded);
+
+            std::string response_body;
+            int response_status = 201;
             {
                 kislay_scoped_lock_t guard(&obj->lock);
-                created_id = kislay_queue_push_locked(obj, queue_name, payload_bytes, headers_bytes, delay_ms, max_attempts);
+                std::string cached_body;
+                int cached_status = 0;
+                if (kislay_queue_idempotency_lookup_locked(obj, idem_key, &cached_body, &cached_status)) {
+                    // Same idempotency key seen before (client-side retry after a
+                    // send-succeeded-but-recv-failed round trip): return the
+                    // original job's response instead of pushing a second job.
+                    response_body = cached_body;
+                    response_status = cached_status;
+                } else {
+                    std::string created_id = kislay_queue_push_locked(obj, queue_name, payload_bytes, headers_bytes, delay_ms, max_attempts);
+                    kislay_queue_ensure_stats_locked(obj, queue_name).push_requests_total++;
+                    response_body = std::string("{\"job_id\":\"") + created_id + "\"}";
+                    response_status = 201;
+                    kislay_queue_idempotency_store_locked(obj, idem_key, response_status, response_body);
+                }
             }
-            zval_ptr_dtor(&decoded);
-            std::string body = std::string("{\"job_id\":\"") + created_id + "\"}";
-            kislay_http_send_response(client_fd, 201, "application/json", body);
+            kislay_http_send_response(client_fd, response_status, "application/json", response_body);
             close(client_fd);
             return;
         }
@@ -1990,7 +2228,13 @@ PHP_METHOD(KislayPHPQueueServer, run) {
         }
 
         // Batch push: POST /v1/queues/{queue}/jobs/batch
-        // Body: {"jobs":[{"payload":...,"delay_ms":0}, ...]}
+        // Body: {"jobs":[{"payload_hex":"...","headers_hex":"...","delay_ms":0,"max_attempts":0}, ...],
+        //        "idempotency_key":"..."}
+        // payload_hex/headers_hex carry the same hex(serialize($value)) encoding
+        // the single-job POST .../jobs endpoint uses (see
+        // kislay_queue_client_push_remote()) - consumers unserialize() them on
+        // fetch (kislay_queue_fill_job_object()), so the batch endpoint has to
+        // produce bytes in that exact format too, not raw json_encode() output.
         std::string batch_queue;
         if (request.method == "POST" &&
             kislay_queue_path_extract(request.path, "/v1/queues/", "/jobs/batch", &batch_queue)) {
@@ -2008,46 +2252,55 @@ PHP_METHOD(KislayPHPQueueServer, run) {
                 close(client_fd);
                 return;
             }
-            std::vector<std::string> ids;
-            zval *job_item;
-            ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(jobs_arr), job_item) {
-                if (Z_TYPE_P(job_item) != IS_ARRAY) continue;
-                zval *payload_zv = zend_hash_str_find(Z_ARRVAL_P(job_item), "payload", sizeof("payload")-1);
-                zend_long delay_ms = 0;
-                zval *delay_zv = zend_hash_str_find(Z_ARRVAL_P(job_item), "delay_ms", sizeof("delay_ms")-1);
-                if (delay_zv && Z_TYPE_P(delay_zv) == IS_LONG) delay_ms = Z_LVAL_P(delay_zv);
-                std::string payload_bytes;
-                if (payload_zv) {
-                    kislay_json_encode_zval(payload_zv, &payload_bytes);
-                } else {
-                    payload_bytes = "{}";
-                }
+            std::string idem_key;
+            kislay_hash_find_string(Z_ARRVAL(decoded), "idempotency_key", &idem_key);
+
+            std::string response_body;
+            int response_status = 201;
+            {
                 kislay_scoped_lock_t guard(&obj->lock);
-                std::string job_id = "job-" + std::to_string(obj->next_job_id++);
-                kislay_queue_job_record_t rec;
-                rec.id = job_id;
-                rec.queue = batch_queue;
-                rec.payload_bytes = payload_bytes;
-                rec.status = "ready";
-                std::uint64_t now_ms = kislay_now_ms();
-                rec.created_at_ms = now_ms;
-                rec.available_at_ms = now_ms + static_cast<std::uint64_t>(delay_ms > 0 ? delay_ms : 0);
-                auto &config = obj->configs[batch_queue];
-                rec.max_attempts = config.max_attempts;
-                obj->jobs[job_id] = std::move(rec);
-                obj->queue_jobs[batch_queue].push_back(job_id);
-                obj->stats[batch_queue].pushed_total++;
-                ids.push_back(job_id);
-            } ZEND_HASH_FOREACH_END();
-            zval_ptr_dtor(&decoded);
-            std::ostringstream resp;
-            resp << "{\"count\":"  << ids.size() << ",\"ids\":[";
-            for (std::size_t i = 0; i < ids.size(); ++i) {
-                if (i > 0) resp << ",";
-                resp << "\"" << ids[i] << "\"";
+                std::string cached_body;
+                int cached_status = 0;
+                if (kislay_queue_idempotency_lookup_locked(obj, idem_key, &cached_body, &cached_status)) {
+                    response_body = cached_body;
+                    response_status = cached_status;
+                } else {
+                    std::vector<std::string> ids;
+                    zval *job_item;
+                    ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(jobs_arr), job_item) {
+                        if (Z_TYPE_P(job_item) != IS_ARRAY) continue;
+                        std::string payload_hex;
+                        std::string headers_hex;
+                        kislay_hash_find_string(Z_ARRVAL_P(job_item), "payload_hex", &payload_hex);
+                        kislay_hash_find_string(Z_ARRVAL_P(job_item), "headers_hex", &headers_hex);
+                        std::string payload_bytes;
+                        std::string headers_bytes;
+                        if (!kislay_hex_decode(payload_hex, &payload_bytes) || !kislay_hex_decode(headers_hex, &headers_bytes)) {
+                            // Skip malformed entries rather than failing the whole
+                            // batch; count/ids in the response reflect exactly
+                            // what was created.
+                            continue;
+                        }
+                        zend_long delay_ms = kislay_hash_find_long(Z_ARRVAL_P(job_item), "delay_ms", 0);
+                        zend_long max_attempts = kislay_hash_find_long(Z_ARRVAL_P(job_item), "max_attempts", 0);
+                        ids.push_back(kislay_queue_push_locked(obj, batch_queue, payload_bytes, headers_bytes, delay_ms, max_attempts));
+                    } ZEND_HASH_FOREACH_END();
+                    kislay_queue_ensure_stats_locked(obj, batch_queue).push_requests_total++;
+
+                    std::ostringstream resp;
+                    resp << "{\"count\":" << ids.size() << ",\"ids\":[";
+                    for (std::size_t i = 0; i < ids.size(); ++i) {
+                        if (i > 0) resp << ",";
+                        resp << "\"" << ids[i] << "\"";
+                    }
+                    resp << "]}";
+                    response_body = resp.str();
+                    response_status = 201;
+                    kislay_queue_idempotency_store_locked(obj, idem_key, response_status, response_body);
+                }
             }
-            resp << "]}";
-            kislay_http_send_response(client_fd, 201, "application/json", resp.str());
+            zval_ptr_dtor(&decoded);
+            kislay_http_send_response(client_fd, response_status, "application/json", response_body);
             close(client_fd);
             return;
         }
@@ -2091,6 +2344,109 @@ PHP_METHOD(KislayPHPQueueClient, __construct) {
     (void) options;
 }
 
+// Builds every job entry in `jobs` into a single POST .../jobs/batch request
+// body and issues exactly one HTTP round trip for the whole batch - this is
+// what fixes the bug where pushBatch() used to loop and call the single-job
+// push endpoint once per job (N round trips instead of 1). `jobs` entries can
+// be a bare payload, or ['payload' => ..., 'options' => [...]] to set
+// per-job delay_ms/max_attempts/headers, matching what pushBatch() already
+// accepted before this fix.
+static bool kislay_queue_client_push_batch_remote(const std::string &base_url, const std::string &queue, zval *jobs, std::vector<std::string> *ids, std::string *error) {
+    zval jobs_json;
+    array_init(&jobs_json);
+
+    zval *entry = nullptr;
+    ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(jobs), entry) {
+        zval *payload = entry;
+        zval *options = nullptr;
+        if (Z_TYPE_P(entry) == IS_ARRAY) {
+            zval *maybe_payload = kislay_hash_find(Z_ARRVAL_P(entry), "payload");
+            if (maybe_payload != nullptr) {
+                payload = maybe_payload;
+                options = kislay_hash_find(Z_ARRVAL_P(entry), "options");
+                if (options != nullptr && Z_TYPE_P(options) != IS_ARRAY) {
+                    options = nullptr;
+                }
+            }
+        }
+
+        std::string payload_bytes;
+        if (!kislay_serialize_payload(payload, &payload_bytes)) {
+            zval_ptr_dtor(&jobs_json);
+            if (error != nullptr) {
+                *error = "Unable to serialize payload";
+            }
+            return false;
+        }
+
+        std::string headers_bytes;
+        zend_long delay_ms = 0;
+        zend_long max_attempts = 0;
+        if (options != nullptr) {
+            HashTable *ht = Z_ARRVAL_P(options);
+            delay_ms = kislay_hash_find_long(ht, "delay_ms", 0);
+            max_attempts = kislay_hash_find_long(ht, "max_attempts", 0);
+            zval *headers = kislay_hash_find(ht, "headers");
+            if (headers != nullptr && Z_TYPE_P(headers) != IS_NULL) {
+                if (!kislay_serialize_payload(headers, &headers_bytes)) {
+                    zval_ptr_dtor(&jobs_json);
+                    if (error != nullptr) {
+                        *error = "Unable to serialize headers";
+                    }
+                    return false;
+                }
+            }
+        }
+
+        zval job_entry;
+        array_init(&job_entry);
+        add_assoc_string(&job_entry, "payload_hex", const_cast<char *>(kislay_hex_encode(payload_bytes).c_str()));
+        add_assoc_string(&job_entry, "headers_hex", const_cast<char *>(kislay_hex_encode(headers_bytes).c_str()));
+        add_assoc_long(&job_entry, "delay_ms", delay_ms);
+        if (max_attempts > 0) {
+            add_assoc_long(&job_entry, "max_attempts", max_attempts);
+        }
+        add_next_index_zval(&jobs_json, &job_entry);
+    } ZEND_HASH_FOREACH_END();
+
+    zval root;
+    array_init(&root);
+    add_assoc_zval(&root, "jobs", &jobs_json);
+    std::string idem_key = kislay_generate_idempotency_key();
+    add_assoc_string(&root, "idempotency_key", const_cast<char *>(idem_key.c_str()));
+
+    std::string json;
+    bool ok = kislay_queue_build_json_body(&root, &json, error);
+    zval_ptr_dtor(&root);
+    if (!ok) {
+        return false;
+    }
+
+    std::ostringstream url;
+    url << base_url << "/v1/queues/" << queue << "/jobs/batch";
+    zval decoded;
+    ZVAL_UNDEF(&decoded);
+    if (!kislay_queue_client_request_json("POST", url.str(), json, &decoded, error)) {
+        return false;
+    }
+    zval *ids_arr = kislay_hash_find(Z_ARRVAL(decoded), "ids");
+    if (ids_arr == nullptr || Z_TYPE_P(ids_arr) != IS_ARRAY) {
+        zval_ptr_dtor(&decoded);
+        if (error != nullptr) {
+            *error = "Queue server response missing ids";
+        }
+        return false;
+    }
+    zval *id_zv;
+    ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(ids_arr), id_zv) {
+        if (Z_TYPE_P(id_zv) == IS_STRING) {
+            ids->push_back(std::string(Z_STRVAL_P(id_zv), Z_STRLEN_P(id_zv)));
+        }
+    } ZEND_HASH_FOREACH_END();
+    zval_ptr_dtor(&decoded);
+    return true;
+}
+
 PHP_METHOD(KislayPHPQueueClient, push) {
     char *queue = nullptr;
     size_t queue_len = 0;
@@ -2123,30 +2479,27 @@ PHP_METHOD(KislayPHPQueueClient, pushBatch) {
     ZEND_PARSE_PARAMETERS_END();
 
     php_kislayphp_queue_client_t *obj = php_kislayphp_queue_client_from_obj(Z_OBJ_P(getThis()));
-    array_init(return_value);
 
-    zval *entry = nullptr;
-    ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(jobs), entry) {
-        zval *payload = entry;
-        zval *options = nullptr;
-        if (Z_TYPE_P(entry) == IS_ARRAY) {
-            zval *maybe_payload = kislay_hash_find(Z_ARRVAL_P(entry), "payload");
-            if (maybe_payload != nullptr) {
-                payload = maybe_payload;
-                options = kislay_hash_find(Z_ARRVAL_P(entry), "options");
-                if (options != nullptr && Z_TYPE_P(options) != IS_ARRAY) {
-                    options = nullptr;
-                }
-            }
-        }
-        std::string job_id;
-        std::string error;
-        if (!kislay_queue_client_push_remote(obj->base_url, std::string(queue, queue_len), payload, options, &job_id, &error)) {
-            zend_throw_exception(zend_ce_exception, error.c_str(), 0);
-            return;
-        }
-        add_next_index_string(return_value, const_cast<char *>(job_id.c_str()));
-    } ZEND_HASH_FOREACH_END();
+    if (zend_hash_num_elements(Z_ARRVAL_P(jobs)) == 0) {
+        array_init(return_value);
+        return;
+    }
+
+    // pushBatch() takes a single $queue for the whole call (there's no way to
+    // route individual entries to different queues), so every job here is
+    // batchable in one request - no mixed-queue fallback case exists to
+    // preserve the old per-job loop for.
+    std::vector<std::string> ids;
+    std::string error;
+    if (!kislay_queue_client_push_batch_remote(obj->base_url, std::string(queue, queue_len), jobs, &ids, &error)) {
+        zend_throw_exception(zend_ce_exception, error.c_str(), 0);
+        return;
+    }
+
+    array_init(return_value);
+    for (std::size_t i = 0; i < ids.size(); ++i) {
+        add_next_index_string(return_value, const_cast<char *>(ids[i].c_str()));
+    }
 }
 
 PHP_METHOD(KislayPHPQueueClient, stats) {
