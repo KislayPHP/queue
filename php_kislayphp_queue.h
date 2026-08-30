@@ -5,7 +5,7 @@ extern "C" {
 #include "php.h"
 }
 
-#define PHP_KISLAYPHP_QUEUE_VERSION "0.0.4"
+#define PHP_KISLAYPHP_QUEUE_VERSION "1.0.0"
 #define PHP_KISLAYPHP_QUEUE_EXTNAME "kislayphp_queue"
 
 extern zend_module_entry kislayphp_queue_module_entry;

@@ -4,8 +4,9 @@
 [![License](https://img.shields.io/badge/License-Apache%202.0-green.svg)](LICENSE)
 [![Build Status](https://img.shields.io/github/actions/workflow/status/KislayPHP/queue/ci.yml?branch=main&label=CI)](https://github.com/KislayPHP/queue/actions)
 [![PIE](https://img.shields.io/badge/install-pie-blueviolet)](https://github.com/php/pie)
+[![Release](https://img.shields.io/badge/Release-1.0.0-orange.svg)]()
 
-> Native PHP distributed job queue for long-running services. Phase 1 ships a standalone queue server, producer client, worker client, retries, delayed jobs, and DLQ support.
+> Native PHP distributed job queue for long-running services: a standalone queue server, producer client, worker client, retries, delayed jobs, and DLQ support.
 
 Part of the [KislayPHP ecosystem](https://skelves.com/kislayphp/docs).
 
@@ -19,7 +20,7 @@ Part of the [KislayPHP ecosystem](https://skelves.com/kislayphp/docs).
 - `Kislay\Queue\Job` for ack/nack control inside a handler
 - `Kislay\Queue\Queue` as the legacy local in-process queue for development fallback
 
-Delivery model in `0.0.4`:
+Delivery model:
 
 - at-least-once delivery
 - one leased job per worker fetch
@@ -31,7 +32,7 @@ Delivery model in `0.0.4`:
 ## Install
 
 ```bash
-pie install kislayphp/queue:0.0.4
+pie install kislayphp/queue:1.0.0
 ```
 
 Enable in `php.ini`:
@@ -163,7 +164,7 @@ $job = $queue->dequeue('jobs');
 
 ## Queue Semantics
 
-`0.0.4` semantics are intentionally explicit:
+Queue semantics are intentionally explicit:
 
 - `push()` creates a job in `ready` or `delayed`
 - `Worker::consume()` fetches one leased job at a time
@@ -174,21 +175,20 @@ $job = $queue->dequeue('jobs');
 
 ## Operational Notes
 
-What `0.0.4` is good for:
+What this is good for:
 
 - background task processing between services
 - queue semantics for microservice workloads
-- development and early production validation
-- explicit retry / DLQ flows
+- production validation with at-least-once delivery and explicit retry/DLQ flows
 
-What `0.0.4` does **not** do yet:
+What this does **not** do:
 
-- durable persistence across queue server restarts
+- durable persistence across queue server restarts (in-memory job state only — if the queue server process stops, unacknowledged jobs are lost; plan around this rather than treating the queue as a durable store)
 - worker concurrency inside one `consume()` loop
 - distributed replication
 - exactly-once delivery
 
-If the queue server process stops, in-memory jobs are lost. That is the correct tradeoff for this phase; do not market it as durable yet.
+These are deliberate scope boundaries, not gaps waiting on a future release — if your workload needs durable cross-restart persistence or exactly-once delivery, this queue's in-memory, at-least-once model is the wrong fit regardless of version.
 
 ## End-to-End Example
 
